@@ -579,6 +579,22 @@ func (p *Update) Copy() PhysicalPlan {
 	return &np
 }
 
+func (p *Update) MarshalJSON() ([]byte, error) {
+	child, err := json.Marshal(p.children[0].(PhysicalPlan))
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	selectPlan, err := json.Marshal(p.SelectPlan.(PhysicalPlan))
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	buffer := bytes.NewBufferString("{")
+	buffer.WriteString(fmt.Sprintf("\"type\": \"Update\",\n"+
+		"\n \"child\": %s\n," +
+		"\n \"SelectPlan\": %s}", child, selectPlan))
+	return buffer.Bytes(), nil
+}
+
 // Copy implements the PhysicalPlan Copy interface.
 func (p *PhysicalDummyScan) Copy() PhysicalPlan {
 	np := *p
