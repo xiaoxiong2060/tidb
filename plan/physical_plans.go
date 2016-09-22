@@ -298,8 +298,10 @@ func (p *PhysicalTableScan) MarshalJSON() ([]byte, error) {
 		"\n \"desc\": %v,"+
 		"\n \"keep order\": %v,"+
 		"\n \"access condition\": %s,"+
-		"\n \"limit\": %d}",
-		p.DBName.O, p.Table.Name.O, p.Desc, p.KeepOrder, access, limit))
+		"\n \"limit\": %d," +
+		"\n \"schema\": %s," +
+		"\n \"column len\": %d}",
+		p.DBName.O, p.Table.Name.O, p.Desc, p.KeepOrder, access, limit, p.schema, len(p.Columns)))
 	return buffer.Bytes(), nil
 }
 

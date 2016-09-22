@@ -152,7 +152,7 @@ type Schema []*Column
 func (s Schema) String() string {
 	strs := make([]string, 0, len(s))
 	for _, col := range s {
-		strs = append(strs, col.String())
+		strs = append(strs, "\"" + col.String() + "\"")
 	}
 	return "[" + strings.Join(strs, ",") + "]"
 }
