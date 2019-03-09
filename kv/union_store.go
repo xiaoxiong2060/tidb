@@ -14,18 +14,15 @@
 package kv
 
 import (
-	"bytes"
-
-	"github.com/juju/errors"
+	"github.com/pingcap/errors"
 )
 
 // UnionStore is a store that wraps a snapshot for read and a BufferStore for buffered write.
 // Also, it provides some transaction related utilities.
 type UnionStore interface {
 	MemBuffer
-	// CheckLazyConditionPairs loads all lazy values from store then checks if all values are matched.
-	// Lazy condition pairs should be checked before transaction commit.
-	CheckLazyConditionPairs() error
+	// Returns related condition pair
+	LookupConditionPair(k Key) *conditionPair
 	// WalkBuffer iterates all buffered kv pairs.
 	WalkBuffer(f func(k Key, v []byte) error) error
 	// SetOption sets an option with a value, when val is nil, uses the default
@@ -35,7 +32,19 @@ type UnionStore interface {
 	DelOption(opt Option)
 	// GetOption gets an option.
 	GetOption(opt Option) interface{}
+	// GetMemBuffer return the MemBuffer binding to this UnionStore.
+	GetMemBuffer() MemBuffer
 }
+
+// AssertionType is the type of a assertion.
+type AssertionType int
+
+// The AssertionType constants.
+const (
+	None AssertionType = iota
+	Exist
+	NotExist
+)
 
 // Option is used for customizing kv store's behaviors during a transaction.
 type Option int
@@ -54,21 +63,29 @@ type conditionPair struct {
 	err   error
 }
 
-// UnionStore is an in-memory Store which contains a buffer for write and a
+func (c *conditionPair) ShouldNotExist() bool {
+	return len(c.value) == 0
+}
+
+func (c *conditionPair) Err() error {
+	return c.err
+}
+
+// unionStore is an in-memory Store which contains a buffer for write and a
 // snapshot for read.
 type unionStore struct {
 	*BufferStore
-	snapshot           Snapshot                    // for read
-	lazyConditionPairs map[string](*conditionPair) // for delay check
+	snapshot           Snapshot                  // for read
+	lazyConditionPairs map[string]*conditionPair // for delay check
 	opts               options
 }
 
 // NewUnionStore builds a new UnionStore.
 func NewUnionStore(snapshot Snapshot) UnionStore {
 	return &unionStore{
-		BufferStore:        NewBufferStore(snapshot),
+		BufferStore:        NewBufferStore(snapshot, DefaultTxnMembufCap),
 		snapshot:           snapshot,
-		lazyConditionPairs: make(map[string](*conditionPair)),
+		lazyConditionPairs: make(map[string]*conditionPair),
 		opts:               make(map[Option]interface{}),
 	}
 }
@@ -95,8 +112,10 @@ func (it invalidIterator) Value() []byte {
 
 func (it invalidIterator) Close() {}
 
+// lazyMemBuffer wraps a MemBuffer which is to be initialized when it is modified.
 type lazyMemBuffer struct {
-	mb MemBuffer
+	mb  MemBuffer
+	cap int
 }
 
 func (lmb *lazyMemBuffer) Get(k Key) ([]byte, error) {
@@ -109,7 +128,7 @@ func (lmb *lazyMemBuffer) Get(k Key) ([]byte, error) {
 
 func (lmb *lazyMemBuffer) Set(key Key, value []byte) error {
 	if lmb.mb == nil {
-		lmb.mb = NewMemDbBuffer()
+		lmb.mb = NewMemDbBuffer(lmb.cap)
 	}
 
 	return lmb.mb.Set(key, value)
@@ -117,24 +136,48 @@ func (lmb *lazyMemBuffer) Set(key Key, value []byte) error {
 
 func (lmb *lazyMemBuffer) Delete(k Key) error {
 	if lmb.mb == nil {
-		lmb.mb = NewMemDbBuffer()
+		lmb.mb = NewMemDbBuffer(lmb.cap)
 	}
 
 	return lmb.mb.Delete(k)
 }
 
-func (lmb *lazyMemBuffer) Seek(k Key) (Iterator, error) {
+func (lmb *lazyMemBuffer) Iter(k Key, upperBound Key) (Iterator, error) {
 	if lmb.mb == nil {
 		return invalidIterator{}, nil
 	}
-	return lmb.mb.Seek(k)
+	return lmb.mb.Iter(k, upperBound)
 }
 
-func (lmb *lazyMemBuffer) SeekReverse(k Key) (Iterator, error) {
+func (lmb *lazyMemBuffer) IterReverse(k Key) (Iterator, error) {
 	if lmb.mb == nil {
 		return invalidIterator{}, nil
 	}
-	return lmb.mb.SeekReverse(k)
+	return lmb.mb.IterReverse(k)
+}
+
+func (lmb *lazyMemBuffer) Size() int {
+	if lmb.mb == nil {
+		return 0
+	}
+	return lmb.mb.Size()
+}
+
+func (lmb *lazyMemBuffer) Len() int {
+	if lmb.mb == nil {
+		return 0
+	}
+	return lmb.mb.Len()
+}
+
+func (lmb *lazyMemBuffer) Reset() {
+	if lmb.mb != nil {
+		lmb.mb.Reset()
+	}
+}
+
+func (lmb *lazyMemBuffer) SetCap(cap int) {
+	lmb.cap = cap
 }
 
 // Get implements the Retriever interface.
@@ -148,7 +191,7 @@ func (us *unionStore) Get(k Key) ([]byte, error) {
 			} else {
 				us.markLazyConditionPair(k, nil, ErrKeyExists)
 			}
-			return nil, errors.Trace(ErrNotExist)
+			return nil, ErrNotExist
 		}
 	}
 	if IsErrNotFound(err) {
@@ -158,7 +201,7 @@ func (us *unionStore) Get(k Key) ([]byte, error) {
 		return v, errors.Trace(err)
 	}
 	if len(v) == 0 {
-		return nil, errors.Trace(ErrNotExist)
+		return nil, ErrNotExist
 	}
 	return v, nil
 }
@@ -173,30 +216,9 @@ func (us *unionStore) markLazyConditionPair(k Key, v []byte, e error) {
 	}
 }
 
-// CheckLazyConditionPairs implements the UnionStore interface.
-func (us *unionStore) CheckLazyConditionPairs() error {
-	if len(us.lazyConditionPairs) == 0 {
-		return nil
-	}
-	keys := make([]Key, 0, len(us.lazyConditionPairs))
-	for _, v := range us.lazyConditionPairs {
-		keys = append(keys, v.key)
-	}
-	values, err := us.snapshot.BatchGet(keys)
-	if err != nil {
-		return errors.Trace(err)
-	}
-
-	for k, v := range us.lazyConditionPairs {
-		if len(v.value) == 0 {
-			if _, exist := values[k]; exist {
-				return errors.Trace(v.err)
-			}
-		} else {
-			if bytes.Compare(values[k], v.value) != 0 {
-				return errors.Trace(ErrLazyConditionPairsNotMatch)
-			}
-		}
+func (us *unionStore) LookupConditionPair(k Key) *conditionPair {
+	if c, ok := us.lazyConditionPairs[string(k)]; ok {
+		return c
 	}
 	return nil
 }
@@ -214,6 +236,20 @@ func (us *unionStore) DelOption(opt Option) {
 // GetOption implements the UnionStore GetOption interface.
 func (us *unionStore) GetOption(opt Option) interface{} {
 	return us.opts[opt]
+}
+
+// GetMemBuffer return the MemBuffer binding to this UnionStore.
+func (us *unionStore) GetMemBuffer() MemBuffer {
+	return us.BufferStore.MemBuffer
+}
+
+// SetCap sets membuffer capability.
+func (us *unionStore) SetCap(cap int) {
+	us.BufferStore.SetCap(cap)
+}
+
+func (us *unionStore) Reset() {
+	us.BufferStore.Reset()
 }
 
 type options map[Option]interface{}

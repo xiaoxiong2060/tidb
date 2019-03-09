@@ -14,50 +14,83 @@
 package executor
 
 import (
-	"encoding/json"
+	"context"
 
-	"github.com/juju/errors"
-	"github.com/pingcap/tidb/ast"
-	"github.com/pingcap/tidb/expression"
-	"github.com/pingcap/tidb/plan"
-	"github.com/pingcap/tidb/util/types"
+	"github.com/cznic/mathutil"
+	"github.com/pingcap/tidb/planner/core"
+	"github.com/pingcap/tidb/util/chunk"
 )
 
 // ExplainExec represents an explain executor.
-// See https://dev.mysql.com/doc/refman/5.7/en/explain-output.html
 type ExplainExec struct {
-	StmtPlan  plan.Plan
-	schema    expression.Schema
-	evaluated bool
+	baseExecutor
+
+	explain     *core.Explain
+	analyzeExec Executor
+	rows        [][]string
+	cursor      int
 }
 
-// Schema implements Executor Schema interface.
-func (e *ExplainExec) Schema() expression.Schema {
-	return e.schema
-}
-
-// Fields implements Executor Fields interface.
-func (e *ExplainExec) Fields() []*ast.ResultField {
+// Open implements the Executor Open interface.
+func (e *ExplainExec) Open(ctx context.Context) error {
+	if e.analyzeExec != nil {
+		return e.analyzeExec.Open(ctx)
+	}
 	return nil
 }
 
-// Next implements Execution Next interface.
-func (e *ExplainExec) Next() (*Row, error) {
-	if e.evaluated {
-		return nil, nil
-	}
-	e.evaluated = true
-	explain, err := json.MarshalIndent(e.StmtPlan, "", "    ")
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-	row := &Row{
-		Data: types.MakeDatums("EXPLAIN", string(explain)),
-	}
-	return row, nil
-}
-
-// Close implements Executor Close interface.
+// Close implements the Executor Close interface.
 func (e *ExplainExec) Close() error {
+	e.rows = nil
 	return nil
+}
+
+// Next implements the Executor Next interface.
+func (e *ExplainExec) Next(ctx context.Context, req *chunk.RecordBatch) error {
+	if e.rows == nil {
+		var err error
+		e.rows, err = e.generateExplainInfo(ctx)
+		if err != nil {
+			return err
+		}
+	}
+
+	req.GrowAndReset(e.maxChunkSize)
+	if e.cursor >= len(e.rows) {
+		return nil
+	}
+
+	numCurRows := mathutil.Min(req.Capacity(), len(e.rows)-e.cursor)
+	for i := e.cursor; i < e.cursor+numCurRows; i++ {
+		for j := range e.rows[i] {
+			req.AppendString(j, e.rows[i][j])
+		}
+	}
+	e.cursor += numCurRows
+	return nil
+}
+
+func (e *ExplainExec) generateExplainInfo(ctx context.Context) ([][]string, error) {
+	if e.analyzeExec != nil {
+		chk := e.analyzeExec.newFirstChunk()
+		for {
+			err := e.analyzeExec.Next(ctx, chunk.NewRecordBatch(chk))
+			if err != nil {
+				return nil, err
+			}
+			if chk.NumRows() == 0 {
+				break
+			}
+		}
+		if err := e.analyzeExec.Close(); err != nil {
+			return nil, err
+		}
+	}
+	if err := e.explain.RenderResult(); err != nil {
+		return nil, err
+	}
+	if e.analyzeExec != nil {
+		e.ctx.GetSessionVars().StmtCtx.RuntimeStatsColl = nil
+	}
+	return e.explain.Rows, nil
 }

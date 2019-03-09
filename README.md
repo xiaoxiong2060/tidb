@@ -1,49 +1,57 @@
-<img src="docs/logo_with_text.png" height=100></img>
+![](docs/logo_with_text.png)
 
 [![Build Status](https://travis-ci.org/pingcap/tidb.svg?branch=master)](https://travis-ci.org/pingcap/tidb)
 [![Go Report Card](https://goreportcard.com/badge/github.com/pingcap/tidb)](https://goreportcard.com/report/github.com/pingcap/tidb)
-![Project Status](https://img.shields.io/badge/status-beta-yellow.svg)
+![GitHub release](https://img.shields.io/github/tag/pingcap/tidb.svg?label=release)
+[![CircleCI Status](https://circleci.com/gh/pingcap/tidb.svg?style=shield)](https://circleci.com/gh/pingcap/tidb)
+[![Coverage Status](https://codecov.io/gh/pingcap/tidb/branch/master/graph/badge.svg)](https://codecov.io/gh/pingcap/tidb)
 
 ## What is TiDB?
 
-TiDB is a distributed SQL database.
-Inspired by the design of Google [F1](http://research.google.com/pubs/pub41344.html), TiDB supports the best features of both traditional RDBMS and NoSQL.
+TiDB (The pronunciation is: /'taɪdiːbi:/ tai-D-B, etymology: titanium) is an open-source distributed scalable Hybrid Transactional and Analytical Processing (HTAP) database. It features horizontal scalability, strong consistency, and high availability. TiDB is MySQL compatible and serves as a one-stop data warehouse for both OLTP (Online Transactional Processing) and OLAP (Online Analytical Processing) workloads.
 
-- __Horizontal scalability__  
-Grow TiDB as your business grows. You can increase the capacity simply by adding more machines.
+- __Horizontal scalability__
 
-- __Asynchronous schema changes__  
-Evolve TiDB schemas as your requirement evolves. You can add new columns and indices without stopping or affecting the on-going operations.
+    TiDB provides horizontal scalability simply by adding new nodes. Never worry about infrastructure capacity ever again.
 
-- __Consistent distributed transactions__  
-Think of TiDB as a single-machine RDBMS. You can start a transaction that crosses multiple machines without worrying about consistency. TiDB makes your application code simple and robust.
+- __MySQL compatibility__
 
-- __Compatible with MySQL protocol__  
-Use TiDB as MySQL. You can replace MySQL with TiDB to power your application without changing a single line of code in most cases.
+    Easily replace MySQL with TiDB to power your applications without changing a single line of code in most cases and still benefit from the MySQL ecosystem.
 
-- __Written in Go__  
-Enjoy TiDB as much as we love Go. We believe Go code is both easy and enjoyable to work with. Go makes us improve TiDB fast and makes it easy to dive into the codebase.
+- __Distributed transaction__
 
+    TiDB is your source of truth, guaranteeing ACID compliance, so your data is accurate and reliable anytime, anywhere.
 
-- __NewSQL over TiKV__  
-  Turn [TiKV](https://github.com/pingcap/tikv) into NewSQL database.
+- __Cloud Native__
 
-- __Multiple storage engine support__  
-Power TiDB with your most favorite engines. TiDB supports many popular storage engines in single-machine mode. You can choose from GolevelDB, LevelDB, RocksDB, LMDB, BoltDB and even more to come.
+    TiDB is designed to work in the cloud -- public, private, or hybrid -- making deployment, provisioning, and maintenance drop-dead simple.
 
+- __Minimize ETL__
+
+    ETL (Extract, Transform and Load) is no longer necessary with TiDB's hybrid OLTP/OLAP architecture, enabling you to create new values for your users, easier and faster.
+
+- __High availability__
+
+    With TiDB, your data and applications are always on and continuously available, so your users are never disappointed.
+
+For more details, see [How we build TiDB](https://pingcap.com/blog/2016-10-17-how-we-build-tidb/).
+
+## Adopters
+
+You can view the list of TiDB adopters [here](https://pingcap.com/docs/adopters/).
 
 ## Roadmap
 
-Read the [Roadmap](./docs/ROADMAP.md).
+Read the [Roadmap](https://pingcap.com/docs/ROADMAP).
 
 ## Quick start
 
-Read the [Quick Start](./docs/QUICKSTART.md).
+Read the [Quick Start](https://pingcap.com/docs/QUICKSTART).
 
 ## Documentation
 
-+ [English](https://github.com/pingcap/docs)
-+ [简体中文](https://github.com/pingcap/docs-cn)
++ [English](https://pingcap.com/docs)
++ [简体中文](https://pingcap.com/docs-cn)
 
 ## Architecture
 
@@ -53,13 +61,17 @@ Read the [Quick Start](./docs/QUICKSTART.md).
 Contributions are welcomed and greatly appreciated. See [CONTRIBUTING.md](CONTRIBUTING.md)
 for details on submitting patches and the contribution workflow.
 
-## Follow us
+## Connect with us
 
-Twitter: [@PingCAP](https://twitter.com/PingCAP)
+- [**Contact PingCAP Team**](http://bit.ly/contact_us_via_github)
+- **Twitter**: [@PingCAP](https://twitter.com/PingCAP)
+- **Reddit**: https://www.reddit.com/r/TiDB/
+- **Stack Overflow**: https://stackoverflow.com/questions/tagged/tidb
+- **Mailing list**: [Google Group](https://groups.google.com/forum/#!forum/tidb-user)
 
 ## License
 TiDB is under the Apache 2.0 license. See the [LICENSE](./LICENSE) file for details.
 
 ## Acknowledgments
 - Thanks [cznic](https://github.com/cznic) for providing some great open source tools.
-- Thanks [GolevelDB](https://github.com/syndtr/goleveldb), [LMDB](https://github.com/LMDB/lmdb), [BoltDB](https://github.com/boltdb/bolt) and [RocksDB](https://github.com/facebook/rocksdb) for their powerful storage engines.
+- Thanks [GolevelDB](https://github.com/syndtr/goleveldb), [BoltDB](https://github.com/boltdb/bolt), and [RocksDB](https://github.com/facebook/rocksdb) for their powerful storage engines.

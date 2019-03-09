@@ -14,41 +14,47 @@
 package tikv
 
 import (
+	"context"
+
 	. "github.com/pingcap/check"
 	"github.com/pingcap/tidb/kv"
 )
 
 type testScanMockSuite struct {
+	OneByOneSuite
 }
 
 var _ = Suite(&testScanMockSuite{})
 
 func (s *testScanMockSuite) TestScanMultipleRegions(c *C) {
-	kvStore, err := NewMockTikvStore()
-	c.Assert(err, IsNil)
-	defer kvStore.Close()
+	store := NewTestStore(c).(*tikvStore)
+	defer store.Close()
 
-	store := kvStore.(*tikvStore)
 	txn, err := store.Begin()
 	c.Assert(err, IsNil)
 	for ch := byte('a'); ch <= byte('z'); ch++ {
 		err = txn.Set([]byte{ch}, []byte{ch})
 		c.Assert(err, IsNil)
 	}
-	err = txn.Commit()
+	err = txn.Commit(context.Background())
 	c.Assert(err, IsNil)
 
 	txn, err = store.Begin()
 	c.Assert(err, IsNil)
 	snapshot := newTiKVSnapshot(store, kv.Version{Ver: txn.StartTS()})
-	scanner, err := newScanner(snapshot, []byte("a"), 10)
+	scanner, err := newScanner(snapshot, []byte("a"), nil, 10)
 	c.Assert(err, IsNil)
 	for ch := byte('a'); ch <= byte('z'); ch++ {
 		c.Assert([]byte{ch}, BytesEquals, []byte(scanner.Key()))
-		if ch < byte('z') {
-			c.Assert(scanner.Next(), IsNil)
-		}
+		c.Assert(scanner.Next(), IsNil)
 	}
-	c.Assert(scanner.Next(), NotNil)
+	c.Assert(scanner.Valid(), IsFalse)
+
+	scanner, err = newScanner(snapshot, []byte("a"), []byte("i"), 10)
+	c.Assert(err, IsNil)
+	for ch := byte('a'); ch <= byte('h'); ch++ {
+		c.Assert([]byte{ch}, BytesEquals, []byte(scanner.Key()))
+		c.Assert(scanner.Next(), IsNil)
+	}
 	c.Assert(scanner.Valid(), IsFalse)
 }

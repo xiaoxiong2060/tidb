@@ -14,42 +14,46 @@
 package ddl
 
 import (
+	"fmt"
+	"strings"
+	"sync/atomic"
 	"time"
 
-	"github.com/juju/errors"
-	"github.com/ngaut/log"
-	"github.com/pingcap/tidb/ast"
+	"github.com/pingcap/errors"
+	"github.com/pingcap/parser/ast"
+	"github.com/pingcap/parser/model"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/tidb/ddl/util"
+	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/infoschema"
-	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta"
-	"github.com/pingcap/tidb/model"
-	"github.com/pingcap/tidb/mysql"
+	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/table"
-	"github.com/pingcap/tidb/tablecodec"
-	"github.com/pingcap/tidb/terror"
-	"github.com/pingcap/tidb/util/types"
+	"github.com/pingcap/tidb/types"
+	"github.com/pingcap/tidb/util/sqlexec"
+	log "github.com/sirupsen/logrus"
 )
 
-func (d *ddl) adjustColumnOffset(columns []*model.ColumnInfo, indices []*model.IndexInfo, offset int, added bool) {
+// adjustColumnInfoInAddColumn is used to set the correct position of column info when adding column.
+// 1. The added column was append at the end of tblInfo.Columns, due to ddl state was not public then.
+//    It should be moved to the correct position when the ddl state to be changed to public.
+// 2. The offset of column should also to be set to the right value.
+func adjustColumnInfoInAddColumn(tblInfo *model.TableInfo, offset int) {
+	oldCols := tblInfo.Columns
+	newCols := make([]*model.ColumnInfo, 0, len(oldCols))
+	newCols = append(newCols, oldCols[:offset]...)
+	newCols = append(newCols, oldCols[len(oldCols)-1])
+	newCols = append(newCols, oldCols[offset:len(oldCols)-1]...)
+	// Adjust column offset.
 	offsetChanged := make(map[int]int)
-	if added {
-		for i := offset + 1; i < len(columns); i++ {
-			offsetChanged[columns[i].Offset] = i
-			columns[i].Offset = i
-		}
-		columns[offset].Offset = offset
-	} else {
-		for i := offset + 1; i < len(columns); i++ {
-			offsetChanged[columns[i].Offset] = i - 1
-			columns[i].Offset = i - 1
-		}
-		columns[offset].Offset = len(columns) - 1
+	for i := offset + 1; i < len(newCols); i++ {
+		offsetChanged[newCols[i].Offset] = i
+		newCols[i].Offset = i
 	}
-
-	// TODO: index can't cover the add/remove column with offset now, we may check this later.
-
+	newCols[offset].Offset = offset
 	// Update index column offset info.
-	for _, idx := range indices {
+	// TODO: There may be some corner cases for index column offsets, we may check this later.
+	for _, idx := range tblInfo.Indices {
 		for _, col := range idx.Columns {
 			newOffset, ok := offsetChanged[col.Offset]
 			if ok {
@@ -57,9 +61,39 @@ func (d *ddl) adjustColumnOffset(columns []*model.ColumnInfo, indices []*model.I
 			}
 		}
 	}
+	tblInfo.Columns = newCols
 }
 
-func (d *ddl) addColumn(tblInfo *model.TableInfo, colInfo *model.ColumnInfo, pos *ast.ColumnPosition) (*model.ColumnInfo, int, error) {
+// adjustColumnInfoInDropColumn is used to set the correct position of column info when dropping column.
+// 1. The offset of column should to be set to the last of the columns.
+// 2. The dropped column is moved to the end of tblInfo.Columns, due to it was not public any more.
+func adjustColumnInfoInDropColumn(tblInfo *model.TableInfo, offset int) {
+	oldCols := tblInfo.Columns
+	// Adjust column offset.
+	offsetChanged := make(map[int]int)
+	for i := offset + 1; i < len(oldCols); i++ {
+		offsetChanged[oldCols[i].Offset] = i - 1
+		oldCols[i].Offset = i - 1
+	}
+	oldCols[offset].Offset = len(oldCols) - 1
+	// Update index column offset info.
+	// TODO: There may be some corner cases for index column offsets, we may check this later.
+	for _, idx := range tblInfo.Indices {
+		for _, col := range idx.Columns {
+			newOffset, ok := offsetChanged[col.Offset]
+			if ok {
+				col.Offset = newOffset
+			}
+		}
+	}
+	newCols := make([]*model.ColumnInfo, 0, len(oldCols))
+	newCols = append(newCols, oldCols[:offset]...)
+	newCols = append(newCols, oldCols[offset+1:]...)
+	newCols = append(newCols, oldCols[offset])
+	tblInfo.Columns = newCols
+}
+
+func createColumnInfo(tblInfo *model.TableInfo, colInfo *model.ColumnInfo, pos *ast.ColumnPosition) (*model.ColumnInfo, int, error) {
 	// Check column name duplicate.
 	cols := tblInfo.Columns
 	position := len(cols)
@@ -68,333 +102,495 @@ func (d *ddl) addColumn(tblInfo *model.TableInfo, colInfo *model.ColumnInfo, pos
 	if pos.Tp == ast.ColumnPositionFirst {
 		position = 0
 	} else if pos.Tp == ast.ColumnPositionAfter {
-		c := findCol(cols, pos.RelativeColumn.Name.L)
+		c := model.FindColumnInfo(cols, pos.RelativeColumn.Name.L)
 		if c == nil {
-			return nil, 0, infoschema.ErrColumnNotExists.Gen("no such column: %v", pos.RelativeColumn)
+			return nil, 0, infoschema.ErrColumnNotExists.GenWithStackByArgs(pos.RelativeColumn, tblInfo.Name)
 		}
 
 		// Insert position is after the mentioned column.
 		position = c.Offset + 1
 	}
-
+	colInfo.ID = allocateColumnID(tblInfo)
 	colInfo.State = model.StateNone
 	// To support add column asynchronous, we should mark its offset as the last column.
 	// So that we can use origin column offset to get value from row.
 	colInfo.Offset = len(cols)
 
-	// Insert col into the right place of the column list.
+	// Append the column info to the end of the tblInfo.Columns.
+	// It will reorder to the right position in "Columns" when it state change to public.
 	newCols := make([]*model.ColumnInfo, 0, len(cols)+1)
-	newCols = append(newCols, cols[:position]...)
+	newCols = append(newCols, cols...)
 	newCols = append(newCols, colInfo)
-	newCols = append(newCols, cols[position:]...)
 
 	tblInfo.Columns = newCols
 	return colInfo, position, nil
 }
 
-func (d *ddl) onAddColumn(t *meta.Meta, job *model.Job) error {
+func checkAddColumn(t *meta.Meta, job *model.Job) (*model.TableInfo, *model.ColumnInfo, *model.ColumnInfo, *ast.ColumnPosition, int, error) {
 	schemaID := job.SchemaID
-	tblInfo, err := d.getTableInfo(t, job)
+	tblInfo, err := getTableInfoAndCancelFaultJob(t, job, schemaID)
 	if err != nil {
-		return errors.Trace(err)
+		return nil, nil, nil, nil, 0, errors.Trace(err)
 	}
-
 	col := &model.ColumnInfo{}
 	pos := &ast.ColumnPosition{}
 	offset := 0
 	err = job.DecodeArgs(col, pos, &offset)
 	if err != nil {
-		job.State = model.JobCancelled
-		return errors.Trace(err)
+		job.State = model.JobStateCancelled
+		return nil, nil, nil, nil, 0, errors.Trace(err)
 	}
 
-	columnInfo := findCol(tblInfo.Columns, col.Name.L)
+	columnInfo := model.FindColumnInfo(tblInfo.Columns, col.Name.L)
 	if columnInfo != nil {
 		if columnInfo.State == model.StatePublic {
-			// we already have a column with same column name
-			job.State = model.JobCancelled
-			return infoschema.ErrColumnExists.Gen("ADD COLUMN: column already exist %s", col.Name.L)
+			// We already have a column with the same column name.
+			job.State = model.JobStateCancelled
+			return nil, nil, nil, nil, 0, infoschema.ErrColumnExists.GenWithStackByArgs(col.Name)
 		}
-	} else {
-		columnInfo, offset, err = d.addColumn(tblInfo, col, pos)
-		if err != nil {
-			job.State = model.JobCancelled
-			return errors.Trace(err)
-		}
+	}
+	return tblInfo, columnInfo, col, pos, offset, nil
+}
 
+func onAddColumn(d *ddlCtx, t *meta.Meta, job *model.Job) (ver int64, err error) {
+	// Handle the rolling back job.
+	if job.IsRollingback() {
+		ver, err = onDropColumn(t, job)
+		if err != nil {
+			return ver, errors.Trace(err)
+		}
+		return ver, nil
+	}
+
+	// gofail: var errorBeforeDecodeArgs bool
+	// if errorBeforeDecodeArgs {
+	// 	return ver, errors.New("occur an error before decode args")
+	// }
+
+	tblInfo, columnInfo, col, pos, offset, err := checkAddColumn(t, job)
+	if err != nil {
+		return ver, errors.Trace(err)
+	}
+	if columnInfo == nil {
+		columnInfo, offset, err = createColumnInfo(tblInfo, col, pos)
+		if err != nil {
+			job.State = model.JobStateCancelled
+			return ver, errors.Trace(err)
+		}
+		log.Infof("[ddl] add column, run DDL job %s, column info %#v, offset %d", job, columnInfo, offset)
 		// Set offset arg to job.
 		if offset != 0 {
 			job.Args = []interface{}{columnInfo, pos, offset}
 		}
+		if err = checkAddColumnTooManyColumns(len(tblInfo.Columns)); err != nil {
+			job.State = model.JobStateCancelled
+			return ver, errors.Trace(err)
+		}
 	}
 
-	_, err = t.GenSchemaVersion()
-	if err != nil {
-		return errors.Trace(err)
-	}
-
+	originalState := columnInfo.State
 	switch columnInfo.State {
 	case model.StateNone:
 		// none -> delete only
 		job.SchemaState = model.StateDeleteOnly
 		columnInfo.State = model.StateDeleteOnly
-		err = t.UpdateTable(schemaID, tblInfo)
-		return errors.Trace(err)
+		ver, err = updateVersionAndTableInfo(t, job, tblInfo, originalState != columnInfo.State)
 	case model.StateDeleteOnly:
 		// delete only -> write only
 		job.SchemaState = model.StateWriteOnly
 		columnInfo.State = model.StateWriteOnly
-		err = t.UpdateTable(schemaID, tblInfo)
-		return errors.Trace(err)
+		ver, err = updateVersionAndTableInfo(t, job, tblInfo, originalState != columnInfo.State)
 	case model.StateWriteOnly:
 		// write only -> reorganization
 		job.SchemaState = model.StateWriteReorganization
 		columnInfo.State = model.StateWriteReorganization
-		// initialize SnapshotVer to 0 for later reorganization check.
-		job.SnapshotVer = 0
-		err = t.UpdateTable(schemaID, tblInfo)
-		return errors.Trace(err)
+		ver, err = updateVersionAndTableInfo(t, job, tblInfo, originalState != columnInfo.State)
 	case model.StateWriteReorganization:
 		// reorganization -> public
-		// get the current version for reorganization if we don't have
-		reorgInfo, err := d.getReorgInfo(t, job)
-		if err != nil || reorgInfo.first {
-			// if we run reorg firstly, we should update the job snapshot version
-			// and then run the reorg next time.
-			return errors.Trace(err)
-		}
-
-		tbl, err := d.getTable(schemaID, tblInfo)
-		if err != nil {
-			return errors.Trace(err)
-		}
-		if columnInfo.DefaultValue != nil || mysql.HasNotNullFlag(columnInfo.Flag) {
-			err = d.runReorgJob(func() error {
-				return d.backfillColumn(tbl, columnInfo, reorgInfo, job)
-			})
-			if terror.ErrorEqual(err, errWaitReorgTimeout) {
-				// if timeout, we should return, check for the owner and re-wait job done.
-				return nil
-			}
-			if err != nil {
-				return errors.Trace(err)
-			}
-		}
-
-		// Adjust column offset.
-		d.adjustColumnOffset(tblInfo.Columns, tblInfo.Indices, offset, true)
-
+		// Adjust table column offset.
+		adjustColumnInfoInAddColumn(tblInfo, offset)
 		columnInfo.State = model.StatePublic
-
-		if err = t.UpdateTable(schemaID, tblInfo); err != nil {
-			return errors.Trace(err)
+		ver, err = updateVersionAndTableInfo(t, job, tblInfo, originalState != columnInfo.State)
+		if err != nil {
+			return ver, errors.Trace(err)
 		}
 
-		// finish this job
-		job.SchemaState = model.StatePublic
-		job.State = model.JobDone
-		return nil
+		// Finish this job.
+		job.FinishTableJob(model.JobStateDone, model.StatePublic, ver, tblInfo)
+		asyncNotifyEvent(d, &util.Event{Tp: model.ActionAddColumn, TableInfo: tblInfo, ColumnInfo: columnInfo})
 	default:
-		return ErrInvalidColumnState.Gen("invalid column state %v", columnInfo.State)
+		err = ErrInvalidColumnState.GenWithStack("invalid column state %v", columnInfo.State)
 	}
+
+	return ver, errors.Trace(err)
 }
 
-func (d *ddl) onDropColumn(t *meta.Meta, job *model.Job) error {
-	schemaID := job.SchemaID
-	tblInfo, err := d.getTableInfo(t, job)
+func onDropColumn(t *meta.Meta, job *model.Job) (ver int64, _ error) {
+	tblInfo, colInfo, err := checkDropColumn(t, job)
 	if err != nil {
-		return errors.Trace(err)
+		return ver, errors.Trace(err)
 	}
 
-	var colName model.CIStr
-	err = job.DecodeArgs(&colName)
-	if err != nil {
-		job.State = model.JobCancelled
-		return errors.Trace(err)
-	}
-
-	colInfo := findCol(tblInfo.Columns, colName.L)
-	if colInfo == nil {
-		job.State = model.JobCancelled
-		return infoschema.ErrColumnNotExists.Gen("column %s doesn't exist", colName)
-	}
-
-	if len(tblInfo.Columns) == 1 {
-		job.State = model.JobCancelled
-		return ErrCantRemoveAllFields.Gen("can't drop only column %s in table %s",
-			colName, tblInfo.Name)
-	}
-
-	// we don't support drop column with index covered now.
-	// we must drop the index first, then drop the column.
-	for _, indexInfo := range tblInfo.Indices {
-		for _, col := range indexInfo.Columns {
-			if col.Name.L == colName.L {
-				job.State = model.JobCancelled
-				return errCantDropColWithIndex.Gen("can't drop column %s with index %s covered now",
-					colName, indexInfo.Name)
-			}
-		}
-	}
-
-	_, err = t.GenSchemaVersion()
-	if err != nil {
-		return errors.Trace(err)
-	}
-
+	originalState := colInfo.State
 	switch colInfo.State {
 	case model.StatePublic:
 		// public -> write only
 		job.SchemaState = model.StateWriteOnly
 		colInfo.State = model.StateWriteOnly
-
-		// set this column's offset to the last and reset all following columns' offset
-		d.adjustColumnOffset(tblInfo.Columns, tblInfo.Indices, colInfo.Offset, false)
-
-		err = t.UpdateTable(schemaID, tblInfo)
-		return errors.Trace(err)
+		// Set this column's offset to the last and reset all following columns' offsets.
+		adjustColumnInfoInDropColumn(tblInfo, colInfo.Offset)
+		// When the dropping column has not-null flag and it hasn't the default value, we can backfill the column value like "add column".
+		// NOTE: If the state of StateWriteOnly can be rollbacked, we'd better reconsider the original default value.
+		// And we need consider the column without not-null flag.
+		if colInfo.OriginDefaultValue == nil && mysql.HasNotNullFlag(colInfo.Flag) {
+			// If the column is timestamp default current_timestamp, and DDL owner is new version TiDB that set column.Version to 1,
+			// then old TiDB update record in the column write only stage will uses the wrong default value of the dropping column.
+			// Because new version of the column default value is UTC time, but old version TiDB will think the default value is the time in system timezone.
+			// But currently will be ok, because we can't cancel the drop column job when the job is running,
+			// so the column will be dropped succeed and client will never see the wrong default value of the dropped column.
+			// More info about this problem, see PR#9115.
+			colInfo.OriginDefaultValue, err = generateOriginDefaultValue(colInfo)
+			if err != nil {
+				return ver, errors.Trace(err)
+			}
+		}
+		ver, err = updateVersionAndTableInfo(t, job, tblInfo, originalState != colInfo.State)
 	case model.StateWriteOnly:
 		// write only -> delete only
 		job.SchemaState = model.StateDeleteOnly
 		colInfo.State = model.StateDeleteOnly
-		err = t.UpdateTable(schemaID, tblInfo)
-		return errors.Trace(err)
+		ver, err = updateVersionAndTableInfo(t, job, tblInfo, originalState != colInfo.State)
 	case model.StateDeleteOnly:
 		// delete only -> reorganization
 		job.SchemaState = model.StateDeleteReorganization
 		colInfo.State = model.StateDeleteReorganization
-		// initialize SnapshotVer to 0 for later reorganization check.
-		job.SnapshotVer = 0
-		err = t.UpdateTable(schemaID, tblInfo)
-		return errors.Trace(err)
+		ver, err = updateVersionAndTableInfo(t, job, tblInfo, originalState != colInfo.State)
 	case model.StateDeleteReorganization:
 		// reorganization -> absent
-		reorgInfo, err := d.getReorgInfo(t, job)
-		if err != nil || reorgInfo.first {
-			// if we run reorg firstly, we should update the job snapshot version
-			// and then run the reorg next time.
-			return errors.Trace(err)
+		// All reorganization jobs are done, drop this column.
+		tblInfo.Columns = tblInfo.Columns[:len(tblInfo.Columns)-1]
+		colInfo.State = model.StateNone
+		ver, err = updateVersionAndTableInfo(t, job, tblInfo, originalState != colInfo.State)
+		if err != nil {
+			return ver, errors.Trace(err)
 		}
 
-		// all reorganization jobs done, drop this column
-		newColumns := make([]*model.ColumnInfo, 0, len(tblInfo.Columns))
-		for _, col := range tblInfo.Columns {
-			if col.Name.L != colName.L {
-				newColumns = append(newColumns, col)
-			}
+		// Finish this job.
+		if job.IsRollingback() {
+			job.FinishTableJob(model.JobStateRollbackDone, model.StateNone, ver, tblInfo)
+		} else {
+			job.FinishTableJob(model.JobStateDone, model.StateNone, ver, tblInfo)
 		}
-		tblInfo.Columns = newColumns
-		if err = t.UpdateTable(schemaID, tblInfo); err != nil {
-			return errors.Trace(err)
-		}
-
-		// finish this job
-		job.SchemaState = model.StateNone
-		job.State = model.JobDone
-		return nil
 	default:
-		return ErrInvalidTableState.Gen("invalid table state %v", tblInfo.State)
+		err = ErrInvalidTableState.GenWithStack("invalid table state %v", tblInfo.State)
 	}
+	return ver, errors.Trace(err)
 }
 
-// How to backfill column data in reorganization state?
-//  1. Generate a snapshot with special version.
-//  2. Traverse the snapshot, get every row in the table.
-//  3. For one row, if the row has been already deleted, skip to next row.
-//  4. If not deleted, check whether column data has existed, if existed, skip to next row.
-//  5. If column data doesn't exist, backfill the column with default value and then continue to handle next row.
-func (d *ddl) backfillColumn(t table.Table, columnInfo *model.ColumnInfo, reorgInfo *reorgInfo, job *model.Job) error {
-	seekHandle := reorgInfo.Handle
-	version := reorgInfo.SnapshotVer
-	count := job.GetRowCount()
-
-	for {
-		startTS := time.Now()
-		handles, err := d.getSnapshotRows(t, version, seekHandle)
-		if err != nil {
-			return errors.Trace(err)
-		} else if len(handles) == 0 {
-			return nil
-		}
-
-		count += int64(len(handles))
-		seekHandle = handles[len(handles)-1] + 1
-		sub := time.Since(startTS).Seconds()
-		err = d.backfillColumnData(t, columnInfo, handles, reorgInfo)
-		if err != nil {
-			log.Warnf("[ddl] added column for %v rows failed, take time %v", count, sub)
-			return errors.Trace(err)
-		}
-
-		job.SetRowCount(count)
-		batchHandleDataHistogram.WithLabelValues(batchAddCol).Observe(sub)
-		log.Infof("[ddl] added column for %v rows, take time %v", count, sub)
+func checkDropColumn(t *meta.Meta, job *model.Job) (*model.TableInfo, *model.ColumnInfo, error) {
+	schemaID := job.SchemaID
+	tblInfo, err := getTableInfoAndCancelFaultJob(t, job, schemaID)
+	if err != nil {
+		return nil, nil, errors.Trace(err)
 	}
+
+	var colName model.CIStr
+	err = job.DecodeArgs(&colName)
+	if err != nil {
+		job.State = model.JobStateCancelled
+		return nil, nil, errors.Trace(err)
+	}
+
+	colInfo := model.FindColumnInfo(tblInfo.Columns, colName.L)
+	if colInfo == nil {
+		job.State = model.JobStateCancelled
+		return nil, nil, ErrCantDropFieldOrKey.GenWithStack("column %s doesn't exist", colName)
+	}
+	if err = isDroppableColumn(tblInfo, colName); err != nil {
+		job.State = model.JobStateCancelled
+		return nil, nil, errors.Trace(err)
+	}
+	return tblInfo, colInfo, nil
 }
 
-func (d *ddl) backfillColumnData(t table.Table, columnInfo *model.ColumnInfo, handles []int64, reorgInfo *reorgInfo) error {
-	var (
-		defaultVal types.Datum
-		err        error
-	)
-	if columnInfo.DefaultValue != nil {
-		defaultVal, _, err = table.GetColDefaultValue(nil, columnInfo)
-		if err != nil {
-			return errors.Trace(err)
-		}
-	} else if mysql.HasNotNullFlag(columnInfo.Flag) {
-		defaultVal = table.GetZeroValue(columnInfo)
+func onSetDefaultValue(t *meta.Meta, job *model.Job) (ver int64, _ error) {
+	newCol := &model.ColumnInfo{}
+	err := job.DecodeArgs(newCol)
+	if err != nil {
+		job.State = model.JobStateCancelled
+		return ver, errors.Trace(err)
 	}
-	colMap := make(map[int64]*types.FieldType)
-	for _, col := range t.Meta().Columns {
-		colMap[col.ID] = &col.FieldType
-	}
-	for _, handle := range handles {
-		log.Debug("[ddl] backfill column...", handle)
-		err := kv.RunInNewTxn(d.store, true, func(txn kv.Transaction) error {
-			if err := d.isReorgRunnable(txn, ddlJobFlag); err != nil {
-				return errors.Trace(err)
-			}
-			rowKey := t.RecordKey(handle)
-			rowVal, err := txn.Get(rowKey)
-			if terror.ErrorEqual(err, kv.ErrNotExist) {
-				// If row doesn't exist, skip it.
-				return nil
-			}
-			if err != nil {
-				return errors.Trace(err)
-			}
-			rowColumns, err := tablecodec.DecodeRow(rowVal, colMap)
-			if err != nil {
-				return errors.Trace(err)
-			}
-			if _, ok := rowColumns[columnInfo.ID]; ok {
-				// The column is already added by update or insert statement, skip it.
-				return nil
-			}
-			newColumnIDs := make([]int64, 0, len(rowColumns)+1)
-			newRow := make([]types.Datum, 0, len(rowColumns)+1)
-			for colID, val := range rowColumns {
-				newColumnIDs = append(newColumnIDs, colID)
-				newRow = append(newRow, val)
-			}
-			newColumnIDs = append(newColumnIDs, columnInfo.ID)
-			newRow = append(newRow, defaultVal)
-			newRowVal, err := tablecodec.EncodeRow(newRow, newColumnIDs)
-			if err != nil {
-				return errors.Trace(err)
-			}
-			err = txn.Set(rowKey, newRowVal)
-			if err != nil {
-				return errors.Trace(err)
-			}
-			return errors.Trace(reorgInfo.UpdateHandle(txn, handle))
-		})
 
+	return updateColumn(t, job, newCol, &newCol.Name)
+}
+
+func (w *worker) onModifyColumn(t *meta.Meta, job *model.Job) (ver int64, _ error) {
+	newCol := &model.ColumnInfo{}
+	oldColName := &model.CIStr{}
+	pos := &ast.ColumnPosition{}
+	var modifyColumnTp byte
+	err := job.DecodeArgs(newCol, oldColName, pos, &modifyColumnTp)
+	if err != nil {
+		job.State = model.JobStateCancelled
+		return ver, errors.Trace(err)
+	}
+
+	return w.doModifyColumn(t, job, newCol, oldColName, pos, modifyColumnTp)
+}
+
+// doModifyColumn updates the column information and reorders all columns.
+func (w *worker) doModifyColumn(t *meta.Meta, job *model.Job, newCol *model.ColumnInfo, oldName *model.CIStr, pos *ast.ColumnPosition, modifyColumnTp byte) (ver int64, _ error) {
+	dbInfo, err := t.GetDatabase(job.SchemaID)
+	if err != nil {
+		return ver, errors.Trace(err)
+	}
+
+	tblInfo, err := getTableInfoAndCancelFaultJob(t, job, job.SchemaID)
+	if err != nil {
+		return ver, errors.Trace(err)
+	}
+
+	oldCol := model.FindColumnInfo(tblInfo.Columns, oldName.L)
+	if job.IsRollingback() {
+		ver, err = rollbackModifyColumnJob(t, tblInfo, job, oldCol, modifyColumnTp)
 		if err != nil {
-			return errors.Trace(err)
+			return ver, errors.Trace(err)
+		}
+		job.FinishTableJob(model.JobStateRollbackDone, model.StateNone, ver, tblInfo)
+		return ver, nil
+	}
+
+	if oldCol == nil || oldCol.State != model.StatePublic {
+		job.State = model.JobStateCancelled
+		return ver, infoschema.ErrColumnNotExists.GenWithStackByArgs(oldName, tblInfo.Name)
+	}
+	// If we want to rename the column name, we need to check whether it already exists.
+	if newCol.Name.L != oldName.L {
+		c := model.FindColumnInfo(tblInfo.Columns, newCol.Name.L)
+		if c != nil {
+			job.State = model.JobStateCancelled
+			return ver, infoschema.ErrColumnExists.GenWithStackByArgs(newCol.Name)
 		}
 	}
 
+	// gofail: var uninitializedOffsetAndState bool
+	// if uninitializedOffsetAndState {
+	// if newCol.State != model.StatePublic {
+	//      return ver, errors.New("the column state is wrong")
+	// }
+	// }
+
+	if !mysql.HasNotNullFlag(oldCol.Flag) && mysql.HasNotNullFlag(newCol.Flag) && !mysql.HasPreventNullInsertFlag(oldCol.Flag) {
+		// Introduce the `mysql.HasPreventNullInsertFlag` flag to prevent users from inserting or updating null values.
+		ver, err = modifyColumnFromNull2NotNull(w, t, dbInfo, tblInfo, job, oldCol, newCol)
+		return ver, errors.Trace(err)
+	}
+
+	// We need the latest column's offset and state. This information can be obtained from the store.
+	newCol.Offset = oldCol.Offset
+	newCol.State = oldCol.State
+	// Calculate column's new position.
+	oldPos, newPos := oldCol.Offset, oldCol.Offset
+	if pos.Tp == ast.ColumnPositionAfter {
+		if oldName.L == pos.RelativeColumn.Name.L {
+			// `alter table tableName modify column b int after b` will return ver,ErrColumnNotExists.
+			// Modified the type definition of 'null' to 'not null' before this, so rollback the job when an error occurs.
+			job.State = model.JobStateRollingback
+			return ver, infoschema.ErrColumnNotExists.GenWithStackByArgs(oldName, tblInfo.Name)
+		}
+
+		relative := model.FindColumnInfo(tblInfo.Columns, pos.RelativeColumn.Name.L)
+		if relative == nil || relative.State != model.StatePublic {
+			job.State = model.JobStateRollingback
+			return ver, infoschema.ErrColumnNotExists.GenWithStackByArgs(pos.RelativeColumn, tblInfo.Name)
+		}
+
+		if relative.Offset < oldPos {
+			newPos = relative.Offset + 1
+		} else {
+			newPos = relative.Offset
+		}
+	} else if pos.Tp == ast.ColumnPositionFirst {
+		newPos = 0
+	}
+
+	columnChanged := make(map[string]*model.ColumnInfo)
+	columnChanged[oldName.L] = newCol
+
+	if newPos == oldPos {
+		tblInfo.Columns[newPos] = newCol
+	} else {
+		cols := tblInfo.Columns
+
+		// Reorder columns in place.
+		if newPos < oldPos {
+			copy(cols[newPos+1:], cols[newPos:oldPos])
+		} else {
+			copy(cols[oldPos:], cols[oldPos+1:newPos+1])
+		}
+		cols[newPos] = newCol
+
+		for i, col := range tblInfo.Columns {
+			if col.Offset != i {
+				columnChanged[col.Name.L] = col
+				col.Offset = i
+			}
+		}
+	}
+
+	// Change offset and name in indices.
+	for _, idx := range tblInfo.Indices {
+		for _, c := range idx.Columns {
+			if newCol, ok := columnChanged[c.Name.L]; ok {
+				c.Name = newCol.Name
+				c.Offset = newCol.Offset
+			}
+		}
+	}
+
+	ver, err = updateVersionAndTableInfo(t, job, tblInfo, true)
+	if err != nil {
+		// Modified the type definition of 'null' to 'not null' before this, so rollBack the job when an error occurs.
+		job.State = model.JobStateRollingback
+		return ver, errors.Trace(err)
+	}
+
+	job.FinishTableJob(model.JobStateDone, model.StatePublic, ver, tblInfo)
+	return ver, nil
+}
+
+// checkForNullValue ensure there are no null values of the column of this table.
+// `isDataTruncated` indicates whether the new field and the old field type are the same, in order to be compatible with mysql.
+func checkForNullValue(ctx sessionctx.Context, isDataTruncated bool, schema, table, oldCol, newCol model.CIStr) error {
+	sql := fmt.Sprintf("select count(*) from `%s`.`%s` where `%s` is null limit 1;", schema.L, table.L, oldCol.L)
+	rows, _, err := ctx.(sqlexec.RestrictedSQLExecutor).ExecRestrictedSQL(ctx, sql)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	rowCount := rows[0].GetInt64(0)
+	if rowCount != 0 {
+		if isDataTruncated {
+			return errInvalidUseOfNull
+		}
+		return ErrWarnDataTruncated.GenWithStackByArgs(newCol.L, rowCount)
+	}
 	return nil
+}
+
+func updateColumn(t *meta.Meta, job *model.Job, newCol *model.ColumnInfo, oldColName *model.CIStr) (ver int64, _ error) {
+	tblInfo, err := getTableInfoAndCancelFaultJob(t, job, job.SchemaID)
+	if err != nil {
+		return ver, errors.Trace(err)
+	}
+	oldCol := model.FindColumnInfo(tblInfo.Columns, oldColName.L)
+	if oldCol == nil || oldCol.State != model.StatePublic {
+		job.State = model.JobStateCancelled
+		return ver, infoschema.ErrColumnNotExists.GenWithStackByArgs(newCol.Name, tblInfo.Name)
+	}
+	*oldCol = *newCol
+
+	ver, err = updateVersionAndTableInfo(t, job, tblInfo, true)
+	if err != nil {
+		job.State = model.JobStateCancelled
+		return ver, errors.Trace(err)
+	}
+
+	job.FinishTableJob(model.JobStateDone, model.StatePublic, ver, tblInfo)
+	return ver, nil
+}
+
+func isColumnWithIndex(colName string, indices []*model.IndexInfo) bool {
+	for _, indexInfo := range indices {
+		for _, col := range indexInfo.Columns {
+			if col.Name.L == colName {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func allocateColumnID(tblInfo *model.TableInfo) int64 {
+	tblInfo.MaxColumnID++
+	return tblInfo.MaxColumnID
+}
+
+func checkAddColumnTooManyColumns(oldCols int) error {
+	if uint32(oldCols) > atomic.LoadUint32(&TableColumnCountLimit) {
+		return errTooManyFields
+	}
+	return nil
+}
+
+// rollbackModifyColumnJob rollbacks the job when an error occurs.
+func rollbackModifyColumnJob(t *meta.Meta, tblInfo *model.TableInfo, job *model.Job, oldCol *model.ColumnInfo, modifyColumnTp byte) (ver int64, _ error) {
+	var err error
+	if modifyColumnTp == mysql.TypeNull {
+		// field NotNullFlag flag reset.
+		tblInfo.Columns[oldCol.Offset].Flag = oldCol.Flag &^ mysql.NotNullFlag
+		// field PreventNullInsertFlag flag reset.
+		tblInfo.Columns[oldCol.Offset].Flag = oldCol.Flag &^ mysql.PreventNullInsertFlag
+		ver, err = updateVersionAndTableInfo(t, job, tblInfo, true)
+		if err != nil {
+			return ver, errors.Trace(err)
+		}
+	}
+	return ver, nil
+}
+
+// modifyColumnFromNull2NotNull modifies the type definitions of 'null' to 'not null'.
+func modifyColumnFromNull2NotNull(w *worker, t *meta.Meta, dbInfo *model.DBInfo, tblInfo *model.TableInfo, job *model.Job, oldCol, newCol *model.ColumnInfo) (ver int64, _ error) {
+	// Get sessionctx from context resource pool.
+	var ctx sessionctx.Context
+	ctx, err := w.sessPool.get()
+	if err != nil {
+		return ver, errors.Trace(err)
+	}
+	defer w.sessPool.put(ctx)
+
+	// If there is a null value inserted, it cannot be modified and needs to be rollback.
+	err = checkForNullValue(ctx, oldCol.Tp == newCol.Tp, dbInfo.Name, tblInfo.Name, oldCol.Name, newCol.Name)
+	if err != nil {
+		job.State = model.JobStateRollingback
+		return ver, errors.Trace(err)
+	}
+
+	// Prevent this field from inserting null values.
+	tblInfo.Columns[oldCol.Offset].Flag |= mysql.PreventNullInsertFlag
+	ver, err = updateVersionAndTableInfo(t, job, tblInfo, true)
+	return ver, errors.Trace(err)
+}
+
+func generateOriginDefaultValue(col *model.ColumnInfo) (interface{}, error) {
+	var err error
+	odValue := col.GetDefaultValue()
+	if odValue == nil && mysql.HasNotNullFlag(col.Flag) {
+		zeroVal := table.GetZeroValue(col)
+		odValue, err = zeroVal.ToString()
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+	}
+
+	if odValue == strings.ToUpper(ast.CurrentTimestamp) {
+		if col.Tp == mysql.TypeTimestamp {
+			odValue = time.Now().UTC().Format(types.TimeFormat)
+			// Version = 1: For OriginDefaultValue and DefaultValue of timestamp column will stores the default time in UTC time zone.
+			//              This will fix bug in version 0.
+			// TODO: remove this version field after there is no old version 0.
+			col.Version = model.ColumnInfoVersion1
+		} else if col.Tp == mysql.TypeDatetime {
+			odValue = time.Now().Format(types.TimeFormat)
+		}
+	}
+	return odValue, nil
+}
+
+func findColumnInIndexCols(c *expression.Column, cols []*ast.IndexColName) bool {
+	for _, c1 := range cols {
+		if c.ColName.L == c1.Column.Name.L {
+			return true
+		}
+	}
+	return false
 }

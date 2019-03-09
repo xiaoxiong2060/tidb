@@ -11,30 +11,39 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// +build !race
+
 package tikv
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"sync"
 	"time"
 
 	. "github.com/pingcap/check"
+	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/kv"
 )
 
+// testIsolationSuite represents test isolation suite.
+// The test suite takes too long under the race detector.
 type testIsolationSuite struct {
+	OneByOneSuite
 	store *tikvStore
 }
 
 var _ = Suite(&testIsolationSuite{})
 
 func (s *testIsolationSuite) SetUpSuite(c *C) {
-	s.store = newTestStore(c)
+	s.OneByOneSuite.SetUpSuite(c)
+	s.store = NewTestStore(c).(*tikvStore)
 }
 
 func (s *testIsolationSuite) TearDownSuite(c *C) {
 	s.store.Close()
+	s.OneByOneSuite.TearDownSuite(c)
 }
 
 type writeRecord struct {
@@ -56,14 +65,14 @@ func (s *testIsolationSuite) SetWithRetry(c *C, k, v []byte) writeRecord {
 		err = txn.Set(k, v)
 		c.Assert(err, IsNil)
 
-		err = txn.Commit()
+		err = txn.Commit(context.Background())
 		if err == nil {
 			return writeRecord{
 				startTS:  txn.StartTS(),
 				commitTS: txn.(*tikvTxn).commitTS,
 			}
 		}
-		c.Assert(kv.IsRetryableError(err), IsTrue)
+		c.Assert(kv.IsRetryableError(err) || terror.ErrorEqual(err, terror.ErrResultUndetermined), IsTrue)
 	}
 }
 

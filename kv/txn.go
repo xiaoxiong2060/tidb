@@ -14,56 +14,67 @@
 package kv
 
 import (
+	"context"
 	"math"
 	"math/rand"
+	"sync/atomic"
 	"time"
 
-	"github.com/juju/errors"
-	"github.com/ngaut/log"
+	"github.com/pingcap/errors"
+	"github.com/pingcap/parser/terror"
+	log "github.com/sirupsen/logrus"
 )
+
+// ContextKey is the type of context's key
+type ContextKey string
 
 // RunInNewTxn will run the f in a new transaction environment.
 func RunInNewTxn(store Storage, retryable bool, f func(txn Transaction) error) error {
 	var (
-		err error
-		txn Transaction
+		err           error
+		originalTxnTS uint64
+		txn           Transaction
 	)
-	for i := 0; i < maxRetryCnt; i++ {
+	for i := uint(0); i < maxRetryCnt; i++ {
 		txn, err = store.Begin()
 		if err != nil {
 			log.Errorf("[kv] RunInNewTxn error - %v", err)
 			return errors.Trace(err)
 		}
 
-		err = f(txn)
-		if retryable && IsRetryableError(err) {
-			log.Warnf("[kv] Retry txn %v", txn)
-			txn.Rollback()
-			continue
+		// originalTxnTS is used to trace the original transaction when the function is retryable.
+		if i == 0 {
+			originalTxnTS = txn.StartTS()
 		}
+
+		err = f(txn)
 		if err != nil {
-			txn.Rollback()
+			err1 := txn.Rollback()
+			terror.Log(errors.Trace(err1))
+			if retryable && IsRetryableError(err) {
+				log.Warnf("[kv] Retry txn %v original txn %v err %v", txn, originalTxnTS, err)
+				continue
+			}
 			return errors.Trace(err)
 		}
 
-		err = txn.Commit()
+		err = txn.Commit(context.Background())
+		if err == nil {
+			break
+		}
 		if retryable && IsRetryableError(err) {
-			log.Warnf("[kv] Retry txn %v", txn)
-			txn.Rollback()
+			log.Warnf("[kv] Retry txn %v original txn %v err %v", txn, originalTxnTS, err)
 			BackOff(i)
 			continue
 		}
-		if err != nil {
-			return errors.Trace(err)
-		}
-		break
+		return errors.Trace(err)
 	}
 	return errors.Trace(err)
 }
 
 var (
-	// Max retry count in RunInNewTxn
-	maxRetryCnt = 100
+	// maxRetryCnt represents maximum retry times in RunInNewTxn.
+	maxRetryCnt uint = 100
 	// retryBackOffBase is the initial duration, in microsecond, a failed transaction stays dormancy before it retries
 	retryBackOffBase = 1
 	// retryBackOffCap is the max amount of duration, in microsecond, a failed transaction stays dormancy before it retries
@@ -73,9 +84,27 @@ var (
 // BackOff Implements exponential backoff with full jitter.
 // Returns real back off time in microsecond.
 // See http://www.awsarchitectureblog.com/2015/03/backoff.html.
-func BackOff(attempts int) int {
+func BackOff(attempts uint) int {
 	upper := int(math.Min(float64(retryBackOffCap), float64(retryBackOffBase)*math.Pow(2.0, float64(attempts))))
 	sleep := time.Duration(rand.Intn(upper)) * time.Millisecond
 	time.Sleep(sleep)
 	return int(sleep)
+}
+
+// mockCommitErrorEnable uses to enable `mockCommitError` and only mock error once.
+var mockCommitErrorEnable = int64(0)
+
+// MockCommitErrorEnable exports for gofail testing.
+func MockCommitErrorEnable() {
+	atomic.StoreInt64(&mockCommitErrorEnable, 1)
+}
+
+// MockCommitErrorDisable exports for gofail testing.
+func MockCommitErrorDisable() {
+	atomic.StoreInt64(&mockCommitErrorEnable, 0)
+}
+
+// IsMockCommitErrorEnable exports for gofail testing.
+func IsMockCommitErrorEnable() bool {
+	return atomic.LoadInt64(&mockCommitErrorEnable) == 1
 }

@@ -13,9 +13,29 @@
 
 package ddl
 
-import "github.com/pingcap/tidb/model"
+import (
+	"context"
 
-// Callback is the interface supporting callback function when DDL changed.
+	"github.com/pingcap/parser/model"
+	"github.com/pingcap/tidb/infoschema"
+	"github.com/pingcap/tidb/sessionctx"
+)
+
+// Interceptor is used for DDL.
+type Interceptor interface {
+	// OnGetInfoSchema is an intercept which is called in the function ddl.GetInfoSchema(). It is used in the tests.
+	OnGetInfoSchema(ctx sessionctx.Context, is infoschema.InfoSchema) infoschema.InfoSchema
+}
+
+// BaseInterceptor implements Interceptor.
+type BaseInterceptor struct{}
+
+// OnGetInfoSchema implements Interceptor.OnGetInfoSchema interface.
+func (bi *BaseInterceptor) OnGetInfoSchema(ctx sessionctx.Context, is infoschema.InfoSchema) infoschema.InfoSchema {
+	return is
+}
+
+// Callback is used for DDL.
 type Callback interface {
 	// OnChanged is called after schema is changed.
 	OnChanged(err error) error
@@ -23,8 +43,8 @@ type Callback interface {
 	OnJobRunBefore(job *model.Job)
 	// OnJobUpdated is called after the running job is updated.
 	OnJobUpdated(job *model.Job)
-	// OnBgJobUpdated is called after the running background job is updated.
-	OnBgJobUpdated(job *model.Job)
+	// OnWatched is called after watching owner is completed.
+	OnWatched(ctx context.Context)
 }
 
 // BaseCallback implements Callback.OnChanged interface.
@@ -46,7 +66,7 @@ func (c *BaseCallback) OnJobUpdated(job *model.Job) {
 	// Nothing to do.
 }
 
-// OnBgJobUpdated implements Callback.OnBgJobUpdated interface.
-func (c *BaseCallback) OnBgJobUpdated(job *model.Job) {
+// OnWatched implements Callback.OnWatched interface.
+func (c *BaseCallback) OnWatched(ctx context.Context) {
 	// Nothing to do.
 }

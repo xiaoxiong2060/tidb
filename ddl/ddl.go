@@ -18,28 +18,57 @@
 package ddl
 
 import (
+	"context"
 	"fmt"
-	"strings"
 	"sync"
 	"time"
 
-	"github.com/juju/errors"
-	"github.com/ngaut/log"
-	"github.com/pingcap/tidb/ast"
-	"github.com/pingcap/tidb/context"
-	"github.com/pingcap/tidb/evaluator"
+	"github.com/coreos/etcd/clientv3"
+	"github.com/ngaut/pools"
+	"github.com/pingcap/errors"
+	"github.com/pingcap/parser/ast"
+	"github.com/pingcap/parser/model"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/parser/terror"
+	pumpcli "github.com/pingcap/tidb-tools/tidb-binlog/pump_client"
+	"github.com/pingcap/tidb/ddl/util"
 	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta"
-	"github.com/pingcap/tidb/meta/autoid"
-	"github.com/pingcap/tidb/model"
-	"github.com/pingcap/tidb/mysql"
+	"github.com/pingcap/tidb/metrics"
+	"github.com/pingcap/tidb/owner"
+	"github.com/pingcap/tidb/sessionctx"
+	"github.com/pingcap/tidb/sessionctx/binloginfo"
 	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/table"
-	"github.com/pingcap/tidb/terror"
-	"github.com/pingcap/tidb/util/charset"
-	"github.com/pingcap/tidb/util/types"
+	tidbutil "github.com/pingcap/tidb/util"
+	log "github.com/sirupsen/logrus"
 	"github.com/twinj/uuid"
+)
+
+const (
+	// currentVersion is for all new DDL jobs.
+	currentVersion = 1
+	// DDLOwnerKey is the ddl owner path that is saved to etcd, and it's exported for testing.
+	DDLOwnerKey = "/tidb/ddl/fg/owner"
+	ddlPrompt   = "ddl"
+
+	shardRowIDBitsMax = 15
+
+	// PartitionCountLimit is limit of the number of partitions in a table.
+	// Mysql maximum number of partitions is 8192, our maximum number of partitions is 1024.
+	// Reference linking https://dev.mysql.com/doc/refman/5.7/en/partitioning-limitations.html.
+	PartitionCountLimit = 1024
+)
+
+var (
+	// TableColumnCountLimit is limit of the number of columns in a table.
+	// It's exported for testing.
+	TableColumnCountLimit = uint32(512)
+	// EnableSplitTableRegion is a flag to decide whether to split a new region for
+	// a newly created table. It takes effect only if the Storage supports split
+	// region.
+	EnableSplitTableRegion = uint32(0)
 )
 
 var (
@@ -47,21 +76,67 @@ var (
 	errInvalidWorker = terror.ClassDDL.New(codeInvalidWorker, "invalid worker")
 	// errNotOwner means we are not owner and can't handle DDL jobs.
 	errNotOwner              = terror.ClassDDL.New(codeNotOwner, "not Owner")
-	errInvalidDDLJob         = terror.ClassDDL.New(codeInvalidDDLJob, "invalid ddl job")
-	errInvalidBgJob          = terror.ClassDDL.New(codeInvalidBgJob, "invalid background job")
+	errCantDecodeIndex       = terror.ClassDDL.New(codeCantDecodeIndex, "cannot decode index value, because %s")
+	errInvalidDDLJob         = terror.ClassDDL.New(codeInvalidDDLJob, "invalid DDL job")
+	errCancelledDDLJob       = terror.ClassDDL.New(codeCancelledDDLJob, "cancelled DDL job")
 	errInvalidJobFlag        = terror.ClassDDL.New(codeInvalidJobFlag, "invalid job flag")
 	errRunMultiSchemaChanges = terror.ClassDDL.New(codeRunMultiSchemaChanges, "can't run multi schema change")
 	errWaitReorgTimeout      = terror.ClassDDL.New(codeWaitReorgTimeout, "wait for reorganization timeout")
 	errInvalidStoreVer       = terror.ClassDDL.New(codeInvalidStoreVer, "invalid storage current version")
 
-	// we don't support drop column with index covered now.
-	errCantDropColWithIndex = terror.ClassDDL.New(codeCantDropColWithIndex, "can't drop column with index")
-	errUnsupportedAddColumn = terror.ClassDDL.New(codeUnsupportedAddColumn, "unsupported add column")
+	// We don't support dropping column with index covered now.
+	errCantDropColWithIndex     = terror.ClassDDL.New(codeCantDropColWithIndex, "can't drop column with index")
+	errUnsupportedAddColumn     = terror.ClassDDL.New(codeUnsupportedAddColumn, "unsupported add column")
+	errUnsupportedModifyColumn  = terror.ClassDDL.New(codeUnsupportedModifyColumn, "unsupported modify column %s")
+	errUnsupportedModifyCharset = terror.ClassDDL.New(codeUnsupportedModifyCharset, "unsupported modify %s")
+	errUnsupportedPKHandle      = terror.ClassDDL.New(codeUnsupportedDropPKHandle,
+		"unsupported drop integer primary key")
+	errUnsupportedCharset = terror.ClassDDL.New(codeUnsupportedCharset, "unsupported charset %s collate %s")
 
-	errBlobKeyWithoutLength = terror.ClassDDL.New(codeBlobKeyWithoutLength, "index for BLOB/TEXT column must specificate a key length")
-	errIncorrectPrefixKey   = terror.ClassDDL.New(codeIncorrectPrefixKey, "Incorrect prefix key; the used key part isn't a string, the used length is longer than the key part, or the storage engine doesn't support unique prefix keys")
-	errTooLongKey           = terror.ClassDDL.New(codeTooLongKey, fmt.Sprintf("Specified key was too long; max key length is %d bytes", maxPrefixLength))
+	errUnsupportedShardRowIDBits = terror.ClassDDL.New(codeUnsupportedShardRowIDBits, "unsupported shard_row_id_bits for table with auto_increment column.")
+	errBlobKeyWithoutLength      = terror.ClassDDL.New(codeBlobKeyWithoutLength, "index for BLOB/TEXT column must specify a key length")
+	errIncorrectPrefixKey        = terror.ClassDDL.New(codeIncorrectPrefixKey, "Incorrect prefix key; the used key part isn't a string, the used length is longer than the key part, or the storage engine doesn't support unique prefix keys")
+	errTooLongKey                = terror.ClassDDL.New(codeTooLongKey,
+		fmt.Sprintf("Specified key was too long; max key length is %d bytes", maxPrefixLength))
+	errKeyColumnDoesNotExits    = terror.ClassDDL.New(codeKeyColumnDoesNotExits, mysql.MySQLErrName[mysql.ErrKeyColumnDoesNotExits])
+	errUnknownTypeLength        = terror.ClassDDL.New(codeUnknownTypeLength, "Unknown length for type tp %d")
+	errUnknownFractionLength    = terror.ClassDDL.New(codeUnknownFractionLength, "Unknown Length for type tp %d and fraction %d")
+	errInvalidJobVersion        = terror.ClassDDL.New(codeInvalidJobVersion, "DDL job with version %d greater than current %d")
+	errFileNotFound             = terror.ClassDDL.New(codeFileNotFound, "Can't find file: './%s/%s.frm'")
+	errErrorOnRename            = terror.ClassDDL.New(codeErrorOnRename, "Error on rename of './%s/%s' to './%s/%s'")
+	errBadField                 = terror.ClassDDL.New(codeBadField, "Unknown column '%s' in '%s'")
+	errInvalidUseOfNull         = terror.ClassDDL.New(codeInvalidUseOfNull, "Invalid use of NULL value")
+	errTooManyFields            = terror.ClassDDL.New(codeTooManyFields, "Too many columns")
+	errInvalidSplitRegionRanges = terror.ClassDDL.New(codeInvalidRanges, "Failed to split region ranges")
+	errReorgPanic               = terror.ClassDDL.New(codeReorgWorkerPanic, "reorg worker panic.")
 
+	// errWrongKeyColumn is for table column cannot be indexed.
+	errWrongKeyColumn = terror.ClassDDL.New(codeWrongKeyColumn, mysql.MySQLErrName[mysql.ErrWrongKeyColumn])
+	// errUnsupportedOnGeneratedColumn is for unsupported actions on generated columns.
+	errUnsupportedOnGeneratedColumn = terror.ClassDDL.New(codeUnsupportedOnGeneratedColumn, mysql.MySQLErrName[mysql.ErrUnsupportedOnGeneratedColumn])
+	// errGeneratedColumnNonPrior forbids to refer generated column non prior to it.
+	errGeneratedColumnNonPrior = terror.ClassDDL.New(codeGeneratedColumnNonPrior, mysql.MySQLErrName[mysql.ErrGeneratedColumnNonPrior])
+	// errDependentByGeneratedColumn forbids to delete columns which are dependent by generated columns.
+	errDependentByGeneratedColumn = terror.ClassDDL.New(codeDependentByGeneratedColumn, mysql.MySQLErrName[mysql.ErrDependentByGeneratedColumn])
+	// errJSONUsedAsKey forbids to use JSON as key or index.
+	errJSONUsedAsKey = terror.ClassDDL.New(codeJSONUsedAsKey, mysql.MySQLErrName[mysql.ErrJSONUsedAsKey])
+	// errBlobCantHaveDefault forbids to give not null default value to TEXT/BLOB/JSON.
+	errBlobCantHaveDefault = terror.ClassDDL.New(codeBlobCantHaveDefault, mysql.MySQLErrName[mysql.ErrBlobCantHaveDefault])
+	errTooLongIndexComment = terror.ClassDDL.New(codeErrTooLongIndexComment, mysql.MySQLErrName[mysql.ErrTooLongIndexComment])
+	// ErrInvalidDefaultValue returns for invalid default value for columns.
+	ErrInvalidDefaultValue = terror.ClassDDL.New(codeInvalidDefaultValue, mysql.MySQLErrName[mysql.ErrInvalidDefault])
+	// ErrGeneratedColumnRefAutoInc forbids to refer generated columns to auto-increment columns .
+	ErrGeneratedColumnRefAutoInc = terror.ClassDDL.New(codeErrGeneratedColumnRefAutoInc, mysql.MySQLErrName[mysql.ErrGeneratedColumnRefAutoInc])
+	// ErrUnsupportedAddPartition returns for does not support add partitions.
+	ErrUnsupportedAddPartition = terror.ClassDDL.New(codeUnsupportedAddPartition, "unsupported add partitions")
+	// ErrUnsupportedCoalescePartition returns for does not support coalesce partitions.
+	ErrUnsupportedCoalescePartition = terror.ClassDDL.New(codeUnsupportedCoalescePartition, "unsupported coalesce partitions")
+	// ErrUnsupportedPartitionByRangeColumns returns for does unsupported partition by range columns.
+	ErrUnsupportedPartitionByRangeColumns = terror.ClassDDL.New(codeUnsupportedPartitionByRangeColumns,
+		"unsupported partition by range columns")
+
+	// ErrDupKeyName returns for duplicated key name
+	ErrDupKeyName = terror.ClassDDL.New(codeDupKeyName, "duplicate key name")
 	// ErrInvalidDBState returns for invalid database state.
 	ErrInvalidDBState = terror.ClassDDL.New(codeInvalidDBState, "invalid database state")
 	// ErrInvalidTableState returns for invalid Table state.
@@ -72,6 +147,9 @@ var (
 	ErrInvalidIndexState = terror.ClassDDL.New(codeInvalidIndexState, "invalid index state")
 	// ErrInvalidForeignKeyState returns for invalid foreign key state.
 	ErrInvalidForeignKeyState = terror.ClassDDL.New(codeInvalidForeignKeyState, "invalid foreign key state")
+	// ErrUnsupportedModifyPrimaryKey returns an error when add or drop the primary key.
+	// It's exported for testing.
+	ErrUnsupportedModifyPrimaryKey = terror.ClassDDL.New(codeUnsupportedModifyPrimaryKey, "unsupported %s primary key")
 
 	// ErrColumnBadNull returns for a bad null value.
 	ErrColumnBadNull = terror.ClassDDL.New(codeBadNull, "column cann't be null")
@@ -80,196 +158,310 @@ var (
 	// ErrCantDropFieldOrKey returns for dropping a non-existent field or key.
 	ErrCantDropFieldOrKey = terror.ClassDDL.New(codeCantDropFieldOrKey, "can't drop field; check that column/key exists")
 	// ErrInvalidOnUpdate returns for invalid ON UPDATE clause.
-	ErrInvalidOnUpdate = terror.ClassDDL.New(codeInvalidOnUpdate, "invalid ON UPDATE clause for the column")
-	// ErrTooLongIdent returns for too long name of database/table/column.
-	ErrTooLongIdent = terror.ClassDDL.New(codeTooLongIdent, "Identifier name too long")
+	ErrInvalidOnUpdate = terror.ClassDDL.New(codeInvalidOnUpdate, mysql.MySQLErrName[mysql.ErrInvalidOnUpdate])
+	// ErrTooLongIdent returns for too long name of database/table/column/index.
+	ErrTooLongIdent = terror.ClassDDL.New(codeTooLongIdent, mysql.MySQLErrName[mysql.ErrTooLongIdent])
+	// ErrWrongDBName returns for wrong database name.
+	ErrWrongDBName = terror.ClassDDL.New(codeWrongDBName, mysql.MySQLErrName[mysql.ErrWrongDBName])
+	// ErrWrongTableName returns for wrong table name.
+	ErrWrongTableName = terror.ClassDDL.New(codeWrongTableName, mysql.MySQLErrName[mysql.ErrWrongTableName])
+	// ErrWrongColumnName returns for wrong column name.
+	ErrWrongColumnName = terror.ClassDDL.New(codeWrongColumnName, mysql.MySQLErrName[mysql.ErrWrongColumnName])
+	// ErrTableMustHaveColumns returns for missing column when creating a table.
+	ErrTableMustHaveColumns = terror.ClassDDL.New(codeTableMustHaveColumns, mysql.MySQLErrName[mysql.ErrTableMustHaveColumns])
+	// ErrWrongNameForIndex returns for wrong index name.
+	ErrWrongNameForIndex = terror.ClassDDL.New(codeWrongNameForIndex, mysql.MySQLErrName[mysql.ErrWrongNameForIndex])
+	// ErrUnknownCharacterSet returns unknown character set.
+	ErrUnknownCharacterSet = terror.ClassDDL.New(codeUnknownCharacterSet, "Unknown character set: '%s'")
+	// ErrPrimaryCantHaveNull returns All parts of a PRIMARY KEY must be NOT NULL; if you need NULL in a key, use UNIQUE instead
+	ErrPrimaryCantHaveNull = terror.ClassDDL.New(codePrimaryCantHaveNull, mysql.MySQLErrName[mysql.ErrPrimaryCantHaveNull])
+
+	// ErrNotAllowedTypeInPartition returns not allowed type error when creating table partiton with unsupport expression type.
+	ErrNotAllowedTypeInPartition = terror.ClassDDL.New(codeErrFieldTypeNotAllowedAsPartitionField, mysql.MySQLErrName[mysql.ErrFieldTypeNotAllowedAsPartitionField])
+	// ErrPartitionsMustBeDefined returns each partition must be defined.
+	ErrPartitionsMustBeDefined = terror.ClassDDL.New(codePartitionsMustBeDefined, "For RANGE partitions each partition must be defined")
+	// ErrPartitionMgmtOnNonpartitioned returns it's not a partition table.
+	ErrPartitionMgmtOnNonpartitioned = terror.ClassDDL.New(codePartitionMgmtOnNonpartitioned, "Partition management on a not partitioned table is not possible")
+	// ErrDropPartitionNonExistent returns error in list of partition.
+	ErrDropPartitionNonExistent = terror.ClassDDL.New(codeDropPartitionNonExistent, " Error in list of partitions to %s")
+	// ErrSameNamePartition returns duplicate partition name.
+	ErrSameNamePartition = terror.ClassDDL.New(codeSameNamePartition, "Duplicate partition name %s")
+	// ErrRangeNotIncreasing returns values less than value must be strictly increasing for each partition.
+	ErrRangeNotIncreasing = terror.ClassDDL.New(codeRangeNotIncreasing, "VALUES LESS THAN value must be strictly increasing for each partition")
+	// ErrPartitionMaxvalue returns maxvalue can only be used in last partition definition.
+	ErrPartitionMaxvalue = terror.ClassDDL.New(codePartitionMaxvalue, "MAXVALUE can only be used in last partition definition")
+	// ErrTooManyValues returns cannot have more than one value for this type of partitioning.
+	ErrTooManyValues = terror.ClassDDL.New(codeErrTooManyValues, mysql.MySQLErrName[mysql.ErrTooManyValues])
+	//ErrDropLastPartition returns cannot remove all partitions, use drop table instead.
+	ErrDropLastPartition = terror.ClassDDL.New(codeDropLastPartition, mysql.MySQLErrName[mysql.ErrDropLastPartition])
+	//ErrTooManyPartitions returns too many partitions were defined.
+	ErrTooManyPartitions = terror.ClassDDL.New(codeTooManyPartitions, mysql.MySQLErrName[mysql.ErrTooManyPartitions])
+	//ErrNoParts returns no partition were defined.
+	ErrNoParts = terror.ClassDDL.New(codeNoParts, mysql.MySQLErrName[mysql.ErrNoParts])
+	//ErrPartitionFunctionIsNotAllowed returns this partition function is not allowed.
+	ErrPartitionFunctionIsNotAllowed = terror.ClassDDL.New(codePartitionFunctionIsNotAllowed, mysql.MySQLErrName[mysql.ErrPartitionFunctionIsNotAllowed])
+	// ErrPartitionFuncNotAllowed returns partition function returns the wrong type.
+	ErrPartitionFuncNotAllowed = terror.ClassDDL.New(codeErrPartitionFuncNotAllowed, mysql.MySQLErrName[mysql.ErrPartitionFuncNotAllowed])
+	// ErrUniqueKeyNeedAllFieldsInPf returns must include all columns in the table's partitioning function.
+	ErrUniqueKeyNeedAllFieldsInPf = terror.ClassDDL.New(codeUniqueKeyNeedAllFieldsInPf, mysql.MySQLErrName[mysql.ErrUniqueKeyNeedAllFieldsInPf])
+	errWrongExprInPartitionFunc   = terror.ClassDDL.New(codeWrongExprInPartitionFunc, mysql.MySQLErrName[mysql.ErrWrongExprInPartitionFunc])
+	// ErrWarnDataTruncated returns data truncated error.
+	ErrWarnDataTruncated = terror.ClassDDL.New(codeWarnDataTruncated, mysql.MySQLErrName[mysql.WarnDataTruncated])
+	// ErrCoalesceOnlyOnHashPartition returns coalesce partition can only be used on hash/key partitions.
+	ErrCoalesceOnlyOnHashPartition = terror.ClassDDL.New(codeCoalesceOnlyOnHashPartition, mysql.MySQLErrName[mysql.ErrCoalesceOnlyOnHashPartition])
+	// ErrViewWrongList returns create view must include all columns in the select clause
+	ErrViewWrongList = terror.ClassDDL.New(codeViewWrongList, mysql.MySQLErrName[mysql.ErrViewWrongList])
+	// ErrAlterOperationNotSupported returns when alter operations is not supported.
+	ErrAlterOperationNotSupported = terror.ClassDDL.New(codeNotSupportedAlterOperation, mysql.MySQLErrName[mysql.ErrAlterOperationNotSupportedReason])
+	// ErrWrongObject returns for wrong object.
+	ErrWrongObject = terror.ClassDDL.New(codeErrWrongObject, mysql.MySQLErrName[mysql.ErrWrongObject])
 )
 
 // DDL is responsible for updating schema in data store and maintaining in-memory InfoSchema cache.
 type DDL interface {
-	CreateSchema(ctx context.Context, name model.CIStr, charsetInfo *ast.CharsetOpt) error
-	DropSchema(ctx context.Context, schema model.CIStr) error
-	CreateTable(ctx context.Context, ident ast.Ident, cols []*ast.ColumnDef,
-		constrs []*ast.Constraint, options []*ast.TableOption) error
-	DropTable(ctx context.Context, tableIdent ast.Ident) (err error)
-	CreateIndex(ctx context.Context, tableIdent ast.Ident, unique bool, indexName model.CIStr,
-		columnNames []*ast.IndexColName) error
-	DropIndex(ctx context.Context, tableIdent ast.Ident, indexName model.CIStr) error
-	GetInformationSchema() infoschema.InfoSchema
-	AlterTable(ctx context.Context, tableIdent ast.Ident, spec []*ast.AlterTableSpec) error
-	TruncateTable(ctx context.Context, tableIdent ast.Ident) error
-	// SetLease will reset the lease time for online DDL change,
-	// it's a very dangerous function and you must guarantee that all servers have the same lease time.
-	SetLease(lease time.Duration)
+	CreateSchema(ctx sessionctx.Context, name model.CIStr, charsetInfo *ast.CharsetOpt) error
+	DropSchema(ctx sessionctx.Context, schema model.CIStr) error
+	CreateTable(ctx sessionctx.Context, stmt *ast.CreateTableStmt) error
+	CreateView(ctx sessionctx.Context, stmt *ast.CreateViewStmt) error
+	CreateTableWithLike(ctx sessionctx.Context, ident, referIdent ast.Ident, ifNotExists bool) error
+	DropTable(ctx sessionctx.Context, tableIdent ast.Ident) (err error)
+	RestoreTable(ctx sessionctx.Context, tbInfo *model.TableInfo, schemaID, autoID, dropJobID int64, snapshotTS uint64) (err error)
+	DropView(ctx sessionctx.Context, tableIdent ast.Ident) (err error)
+	CreateIndex(ctx sessionctx.Context, tableIdent ast.Ident, unique bool, indexName model.CIStr,
+		columnNames []*ast.IndexColName, indexOption *ast.IndexOption) error
+	DropIndex(ctx sessionctx.Context, tableIdent ast.Ident, indexName model.CIStr) error
+	AlterTable(ctx sessionctx.Context, tableIdent ast.Ident, spec []*ast.AlterTableSpec) error
+	TruncateTable(ctx sessionctx.Context, tableIdent ast.Ident) error
+	RenameTable(ctx sessionctx.Context, oldTableIdent, newTableIdent ast.Ident, isAlterTable bool) error
+
 	// GetLease returns current schema lease time.
 	GetLease() time.Duration
 	// Stats returns the DDL statistics.
-	Stats() (map[string]interface{}, error)
+	Stats(vars *variable.SessionVars) (map[string]interface{}, error)
 	// GetScope gets the status variables scope.
 	GetScope(status string) variable.ScopeFlag
 	// Stop stops DDL worker.
 	Stop() error
-	// Start starts DDL worker.
-	Start() error
+	// RegisterEventCh registers event channel for ddl.
+	RegisterEventCh(chan<- *util.Event)
+	// SchemaSyncer gets the schema syncer.
+	SchemaSyncer() SchemaSyncer
+	// OwnerManager gets the owner manager.
+	OwnerManager() owner.Manager
+	// GetID gets the ddl ID.
+	GetID() string
+	// GetTableMaxRowID gets the max row ID of a normal table or a partition.
+	GetTableMaxRowID(startTS uint64, tbl table.PhysicalTable) (int64, bool, error)
+	// SetBinlogClient sets the binlog client for DDL worker. It's exported for testing.
+	SetBinlogClient(*pumpcli.PumpsClient)
+	// GetHook gets the hook. It's exported for testing.
+	GetHook() Callback
 }
 
+// ddl is used to handle the statements that define the structure or schema of the database.
 type ddl struct {
-	m sync.RWMutex
-
+	m          sync.RWMutex
 	infoHandle *infoschema.Handle
-	hook       Callback
-	hookMu     sync.RWMutex
-	store      kv.Storage
-	// schema lease seconds.
-	lease        time.Duration
-	uuid         string
-	ddlJobCh     chan struct{}
-	ddlJobDoneCh chan struct{}
-	// drop database/table job runs in the background.
-	bgJobCh chan struct{}
-	// reorgDoneCh is for reorganization, if the reorganization job is done,
-	// we will use this channel to notify outer.
-	// TODO: now we use goroutine to simulate reorganization jobs, later we may
-	// use a persistent job list.
-	reorgDoneCh chan error
+	quitCh     chan struct{}
 
-	quitCh chan struct{}
-	wait   sync.WaitGroup
+	*ddlCtx
+	workers     map[workerType]*worker
+	sessPool    *sessionPool
+	delRangeMgr delRangeManager
+}
+
+// ddlCtx is the context when we use worker to handle DDL jobs.
+type ddlCtx struct {
+	uuid         string
+	store        kv.Storage
+	ownerManager owner.Manager
+	schemaSyncer SchemaSyncer
+	ddlJobDoneCh chan struct{}
+	ddlEventCh   chan<- *util.Event
+	lease        time.Duration        // lease is schema lease.
+	binlogCli    *pumpcli.PumpsClient // binlogCli is used for Binlog.
+
+	// hook may be modified.
+	mu struct {
+		sync.RWMutex
+		hook        Callback
+		interceptor Interceptor
+	}
+}
+
+func (dc *ddlCtx) isOwner() bool {
+	isOwner := dc.ownerManager.IsOwner()
+	log.Debugf("[ddl] it's the DDL owner %v, self ID %s", isOwner, dc.uuid)
+	if isOwner {
+		metrics.DDLCounter.WithLabelValues(metrics.DDLOwner + "_" + mysql.TiDBReleaseVersion).Inc()
+	}
+	return isOwner
+}
+
+// RegisterEventCh registers passed channel for ddl Event.
+func (d *ddl) RegisterEventCh(ch chan<- *util.Event) {
+	d.ddlEventCh = ch
+}
+
+// asyncNotifyEvent will notify the ddl event to outside world, say statistic handle. When the channel is full, we may
+// give up notify and log it.
+func asyncNotifyEvent(d *ddlCtx, e *util.Event) {
+	if d.ddlEventCh != nil {
+		if d.lease == 0 {
+			// If lease is 0, it's always used in test.
+			select {
+			case d.ddlEventCh <- e:
+			default:
+			}
+			return
+		}
+		for i := 0; i < 10; i++ {
+			select {
+			case d.ddlEventCh <- e:
+				return
+			default:
+				log.Warnf("Fail to notify event %s.", e)
+				time.Sleep(time.Microsecond * 10)
+			}
+		}
+	}
 }
 
 // NewDDL creates a new DDL.
-func NewDDL(store kv.Storage, infoHandle *infoschema.Handle, hook Callback, lease time.Duration) DDL {
-	return newDDL(store, infoHandle, hook, lease)
+func NewDDL(ctx context.Context, etcdCli *clientv3.Client, store kv.Storage,
+	infoHandle *infoschema.Handle, hook Callback, lease time.Duration, ctxPool *pools.ResourcePool) DDL {
+	return newDDL(ctx, etcdCli, store, infoHandle, hook, lease, ctxPool)
 }
 
-func newDDL(store kv.Storage, infoHandle *infoschema.Handle, hook Callback, lease time.Duration) *ddl {
+func newDDL(ctx context.Context, etcdCli *clientv3.Client, store kv.Storage,
+	infoHandle *infoschema.Handle, hook Callback, lease time.Duration, ctxPool *pools.ResourcePool) *ddl {
 	if hook == nil {
 		hook = &BaseCallback{}
 	}
-
-	d := &ddl{
-		infoHandle:   infoHandle,
-		hook:         hook,
-		store:        store,
-		lease:        lease,
-		uuid:         uuid.NewV4().String(),
-		ddlJobCh:     make(chan struct{}, 1),
-		ddlJobDoneCh: make(chan struct{}, 1),
-		bgJobCh:      make(chan struct{}, 1),
+	id := uuid.NewV4().String()
+	ctx, cancelFunc := context.WithCancel(ctx)
+	var manager owner.Manager
+	var syncer SchemaSyncer
+	if etcdCli == nil {
+		// The etcdCli is nil if the store is localstore which is only used for testing.
+		// So we use mockOwnerManager and MockSchemaSyncer.
+		manager = owner.NewMockManager(id, cancelFunc)
+		syncer = NewMockSchemaSyncer()
+	} else {
+		manager = owner.NewOwnerManager(etcdCli, ddlPrompt, id, DDLOwnerKey, cancelFunc)
+		syncer = NewSchemaSyncer(etcdCli, id)
 	}
 
-	d.start()
+	ddlCtx := &ddlCtx{
+		uuid:         id,
+		store:        store,
+		lease:        lease,
+		ddlJobDoneCh: make(chan struct{}, 1),
+		ownerManager: manager,
+		schemaSyncer: syncer,
+		binlogCli:    binloginfo.GetPumpsClient(),
+	}
+	ddlCtx.mu.hook = hook
+	ddlCtx.mu.interceptor = &BaseInterceptor{}
+	d := &ddl{
+		infoHandle: infoHandle,
+		ddlCtx:     ddlCtx,
+	}
 
+	d.start(ctx, ctxPool)
 	variable.RegisterStatistics(d)
 
+	metrics.DDLCounter.WithLabelValues(metrics.CreateDDLInstance).Inc()
 	return d
 }
 
+// Stop implements DDL.Stop interface.
 func (d *ddl) Stop() error {
 	d.m.Lock()
 	defer d.m.Unlock()
 
 	d.close()
-
-	err := kv.RunInNewTxn(d.store, true, func(txn kv.Transaction) error {
-		t := meta.NewMeta(txn)
-		owner, err1 := t.GetDDLJobOwner()
-		if err1 != nil {
-			return errors.Trace(err1)
-		}
-		if owner == nil || owner.OwnerID != d.uuid {
-			return nil
-		}
-
-		// ddl job's owner is me, clean it so other servers can compete for it quickly.
-		return t.SetDDLJobOwner(&model.Owner{})
-	})
-	if err != nil {
-		return errors.Trace(err)
-	}
-
-	err = kv.RunInNewTxn(d.store, true, func(txn kv.Transaction) error {
-		t := meta.NewMeta(txn)
-		owner, err1 := t.GetBgJobOwner()
-		if err1 != nil {
-			return errors.Trace(err1)
-		}
-		if owner == nil || owner.OwnerID != d.uuid {
-			return nil
-		}
-
-		// background job's owner is me, clean it so other servers can compete for it quickly.
-		return t.SetBgJobOwner(&model.Owner{})
-	})
-
-	return errors.Trace(err)
-}
-
-func (d *ddl) Start() error {
-	d.m.Lock()
-	defer d.m.Unlock()
-
-	if !d.isClosed() {
-		return nil
-	}
-
-	d.start()
-
+	log.Infof("[ddl] stop DDL:%s", d.uuid)
 	return nil
 }
 
-func (d *ddl) start() {
+func (d *ddl) newDeleteRangeManager(mock bool) delRangeManager {
+	var delRangeMgr delRangeManager
+	if !mock {
+		delRangeMgr = newDelRangeManager(d.store, d.sessPool)
+		log.Infof("[ddl] start delRangeManager OK, with emulator: %t", !d.store.SupportDeleteRange())
+	} else {
+		delRangeMgr = newMockDelRangeManager()
+	}
+
+	delRangeMgr.start()
+	return delRangeMgr
+}
+
+// start campaigns the owner and starts workers.
+// ctxPool is used for the worker's delRangeManager and creates sessions.
+func (d *ddl) start(ctx context.Context, ctxPool *pools.ResourcePool) {
+	log.Infof("[ddl] start DDL:%s, run worker %v", d.uuid, RunWorker)
 	d.quitCh = make(chan struct{})
-	d.wait.Add(2)
-	go d.onBackgroundWorker()
-	go d.onDDLWorker()
-	// for every start, we will send a fake job to let worker
-	// check owner first and try to find whether a job exists and run.
-	asyncNotify(d.ddlJobCh)
-	asyncNotify(d.bgJobCh)
+
+	// If RunWorker is true, we need campaign owner and do DDL job.
+	// Otherwise, we needn't do that.
+	if RunWorker {
+		err := d.ownerManager.CampaignOwner(ctx)
+		terror.Log(errors.Trace(err))
+
+		d.workers = make(map[workerType]*worker, 2)
+		d.sessPool = newSessionPool(ctxPool)
+		d.delRangeMgr = d.newDeleteRangeManager(ctxPool == nil)
+		d.workers[generalWorker] = newWorker(generalWorker, d.store, d.sessPool, d.delRangeMgr)
+		d.workers[addIdxWorker] = newWorker(addIdxWorker, d.store, d.sessPool, d.delRangeMgr)
+		for _, worker := range d.workers {
+			worker.wg.Add(1)
+			w := worker
+			go tidbutil.WithRecovery(
+				func() { w.start(d.ddlCtx) },
+				func(r interface{}) {
+					if r != nil {
+						log.Errorf("[ddl-%s] ddl %s meet panic", w, d.uuid)
+						metrics.PanicCounter.WithLabelValues(metrics.LabelDDL).Inc()
+					}
+				})
+			metrics.DDLCounter.WithLabelValues(fmt.Sprintf("%s_%s", metrics.CreateDDL, worker.String())).Inc()
+
+			// When the start function is called, we will send a fake job to let worker
+			// checks owner firstly and try to find whether a job exists and run.
+			asyncNotify(worker.ddlJobCh)
+		}
+	}
 }
 
 func (d *ddl) close() {
-	if d.isClosed() {
+	if isChanClosed(d.quitCh) {
 		return
 	}
 
+	startTime := time.Now()
 	close(d.quitCh)
-
-	d.wait.Wait()
-}
-
-func (d *ddl) isClosed() bool {
-	select {
-	case <-d.quitCh:
-		return true
-	default:
-		return false
-	}
-}
-
-func (d *ddl) SetLease(lease time.Duration) {
-	d.m.Lock()
-	defer d.m.Unlock()
-
-	if lease == d.lease {
-		return
+	d.ownerManager.Cancel()
+	err := d.schemaSyncer.RemoveSelfVersionPath()
+	if err != nil {
+		log.Errorf("[ddl] remove self version path failed %v", err)
 	}
 
-	log.Warnf("[ddl] change schema lease %s -> %s", d.lease, lease)
-
-	if d.isClosed() {
-		// if already closed, just set lease and return
-		d.lease = lease
-		return
+	for _, worker := range d.workers {
+		worker.close()
+	}
+	if d.sessPool != nil {
+		d.sessPool.close()
+	}
+	if d.delRangeMgr != nil {
+		d.delRangeMgr.clear()
 	}
 
-	// close the running worker and start again
-	d.close()
-	d.lease = lease
-	d.start()
+	log.Infof("[ddl] closing DDL:%s takes time %v", d.uuid, time.Since(startTime))
 }
 
+// GetLease implements DDL.GetLease interface.
 func (d *ddl) GetLease() time.Duration {
 	d.m.RLock()
 	lease := d.lease
@@ -277,14 +469,27 @@ func (d *ddl) GetLease() time.Duration {
 	return lease
 }
 
-func (d *ddl) GetInformationSchema() infoschema.InfoSchema {
-	return d.infoHandle.Get()
+// GetInfoSchemaWithInterceptor gets the infoschema binding to d. It's exported for testing.
+// Please don't use this function, it is used by TestParallelDDLBeforeRunDDLJob to intercept the calling of d.infoHandle.Get(), use d.infoHandle.Get() instead.
+// Otherwise, the TestParallelDDLBeforeRunDDLJob will hang up forever.
+func (d *ddl) GetInfoSchemaWithInterceptor(ctx sessionctx.Context) infoschema.InfoSchema {
+	is := d.infoHandle.Get()
+
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.mu.interceptor.OnGetInfoSchema(ctx, is)
 }
 
 func (d *ddl) genGlobalID() (int64, error) {
 	var globalID int64
 	err := kv.RunInNewTxn(d.store, true, func(txn kv.Transaction) error {
 		var err error
+
+		// gofail: var mockGenGlobalIDFail bool
+		// if mockGenGlobalIDFail {
+		//	 return errors.New("gofail genGlobalID error")
+		// }
+
 		globalID, err = meta.NewMeta(txn).GenGlobalID()
 		return errors.Trace(err)
 	})
@@ -292,982 +497,118 @@ func (d *ddl) genGlobalID() (int64, error) {
 	return globalID, errors.Trace(err)
 }
 
-func (d *ddl) CreateSchema(ctx context.Context, schema model.CIStr, charsetInfo *ast.CharsetOpt) (err error) {
-	is := d.GetInformationSchema()
-	_, ok := is.SchemaByName(schema)
-	if ok {
-		return errors.Trace(infoschema.ErrDatabaseExists)
+// SchemaSyncer implements DDL.SchemaSyncer interface.
+func (d *ddl) SchemaSyncer() SchemaSyncer {
+	return d.schemaSyncer
+}
+
+// OwnerManager implements DDL.OwnerManager interface.
+func (d *ddl) OwnerManager() owner.Manager {
+	return d.ownerManager
+}
+
+// GetID implements DDL.GetID interface.
+func (d *ddl) GetID() string {
+	return d.uuid
+}
+
+func checkJobMaxInterval(job *model.Job) time.Duration {
+	// The job of adding index takes more time to process.
+	// So it uses the longer time.
+	if job.Type == model.ActionAddIndex {
+		return 3 * time.Second
+	}
+	if job.Type == model.ActionCreateTable || job.Type == model.ActionCreateSchema {
+		return 500 * time.Millisecond
+	}
+	return 1 * time.Second
+}
+
+func (d *ddl) asyncNotifyWorker(jobTp model.ActionType) {
+	// If the workers don't run, we needn't to notify workers.
+	if !RunWorker {
+		return
 	}
 
-	if err = checkTooLongSchema(schema); err != nil {
-		return errors.Trace(err)
-	}
-
-	schemaID, err := d.genGlobalID()
-	if err != nil {
-		return errors.Trace(err)
-	}
-	dbInfo := &model.DBInfo{
-		Name: schema,
-	}
-	if charsetInfo != nil {
-		dbInfo.Charset = charsetInfo.Chs
-		dbInfo.Collate = charsetInfo.Col
+	if jobTp == model.ActionAddIndex {
+		asyncNotify(d.workers[addIdxWorker].ddlJobCh)
 	} else {
-		dbInfo.Charset, dbInfo.Collate = getDefaultCharsetAndCollate()
+		asyncNotify(d.workers[generalWorker].ddlJobCh)
 	}
-
-	job := &model.Job{
-		SchemaID: schemaID,
-		Type:     model.ActionCreateSchema,
-		Args:     []interface{}{dbInfo},
-	}
-
-	err = d.doDDLJob(ctx, job)
-	err = d.callHookOnChanged(err)
-	return errors.Trace(err)
 }
 
-func (d *ddl) DropSchema(ctx context.Context, schema model.CIStr) (err error) {
-	is := d.GetInformationSchema()
-	old, ok := is.SchemaByName(schema)
-	if !ok {
-		return errors.Trace(infoschema.ErrDatabaseNotExists)
+func (d *ddl) doDDLJob(ctx sessionctx.Context, job *model.Job) error {
+	// Get a global job ID and put the DDL job in the queue.
+	err := d.addDDLJob(ctx, job)
+	if err != nil {
+		return errors.Trace(err)
 	}
+	ctx.GetSessionVars().StmtCtx.IsDDLJobInQueue = true
 
-	job := &model.Job{
-		SchemaID: old.ID,
-		Type:     model.ActionDropSchema,
-	}
+	// Notice worker that we push a new job and wait the job done.
+	d.asyncNotifyWorker(job.Type)
+	log.Infof("[ddl] start DDL job %s, Query:%s", job, job.Query)
 
-	err = d.doDDLJob(ctx, job)
-	err = d.callHookOnChanged(err)
-	return errors.Trace(err)
-}
-
-func checkTooLongSchema(schema model.CIStr) error {
-	if len(schema.L) > mysql.MaxDatabaseNameLength {
-		return ErrTooLongIdent.Gen("too long schema %s", schema.L)
-	}
-	return nil
-}
-
-func checkTooLongTable(table model.CIStr) error {
-	if len(table.L) > mysql.MaxTableNameLength {
-		return ErrTooLongIdent.Gen("too long table %s", table.L)
-	}
-	return nil
-}
-
-func getDefaultCharsetAndCollate() (string, string) {
-	// TODO: TableDefaultCharset-->DatabaseDefaultCharset-->SystemDefaultCharset.
-	// TODO: change TableOption parser to parse collate.
-	// This is a tmp solution.
-	return "utf8", "utf8_unicode_ci"
-}
-
-func setColumnFlagWithConstraint(colMap map[string]*table.Column, v *ast.Constraint) {
-	switch v.Tp {
-	case ast.ConstraintPrimaryKey:
-		for _, key := range v.Keys {
-			c, ok := colMap[key.Column.Name.L]
-			if !ok {
-				// TODO: table constraint on unknown column.
-				continue
-			}
-			c.Flag |= mysql.PriKeyFlag
-			// Primary key can not be NULL.
-			c.Flag |= mysql.NotNullFlag
+	var historyJob *model.Job
+	jobID := job.ID
+	// For a job from start to end, the state of it will be none -> delete only -> write only -> reorganization -> public
+	// For every state changes, we will wait as lease 2 * lease time, so here the ticker check is 10 * lease.
+	// But we use etcd to speed up, normally it takes less than 0.5s now, so we use 0.5s or 1s or 3s as the max value.
+	ticker := time.NewTicker(chooseLeaseTime(10*d.lease, checkJobMaxInterval(job)))
+	startTime := time.Now()
+	metrics.JobsGauge.WithLabelValues(job.Type.String()).Inc()
+	defer func() {
+		ticker.Stop()
+		metrics.JobsGauge.WithLabelValues(job.Type.String()).Dec()
+		metrics.HandleJobHistogram.WithLabelValues(job.Type.String(), metrics.RetLabel(err)).Observe(time.Since(startTime).Seconds())
+	}()
+	for {
+		select {
+		case <-d.ddlJobDoneCh:
+		case <-ticker.C:
 		}
-	case ast.ConstraintUniq, ast.ConstraintUniqIndex, ast.ConstraintUniqKey:
-		for i, key := range v.Keys {
-			c, ok := colMap[key.Column.Name.L]
-			if !ok {
-				// TODO: table constraint on unknown column.
-				continue
-			}
-			if i == 0 {
-				// Only the first column can be set
-				// if unique index has multi columns,
-				// the flag should be MultipleKeyFlag.
-				// See https://dev.mysql.com/doc/refman/5.7/en/show-columns.html
-				if len(v.Keys) > 1 {
-					c.Flag |= mysql.MultipleKeyFlag
-				} else {
-					c.Flag |= mysql.UniqueKeyFlag
-				}
-			}
-		}
-	case ast.ConstraintKey, ast.ConstraintIndex:
-		for i, key := range v.Keys {
-			c, ok := colMap[key.Column.Name.L]
-			if !ok {
-				// TODO: table constraint on unknown column.
-				continue
-			}
-			if i == 0 {
-				// Only the first column can be set.
-				c.Flag |= mysql.MultipleKeyFlag
-			}
-		}
-	}
-}
 
-func (d *ddl) buildColumnsAndConstraints(ctx context.Context, colDefs []*ast.ColumnDef,
-	constraints []*ast.Constraint) ([]*table.Column, []*ast.Constraint, error) {
-	var cols []*table.Column
-	colMap := map[string]*table.Column{}
-	for i, colDef := range colDefs {
-		col, cts, err := d.buildColumnAndConstraint(ctx, i, colDef)
+		historyJob, err = d.getHistoryDDLJob(jobID)
 		if err != nil {
-			return nil, nil, errors.Trace(err)
-		}
-		col.State = model.StatePublic
-		constraints = append(constraints, cts...)
-		cols = append(cols, col)
-		colMap[colDef.Name.Name.L] = col
-	}
-	// traverse table Constraints and set col.flag
-	for _, v := range constraints {
-		setColumnFlagWithConstraint(colMap, v)
-	}
-	return cols, constraints, nil
-}
-
-func (d *ddl) buildColumnAndConstraint(ctx context.Context, offset int,
-	colDef *ast.ColumnDef) (*table.Column, []*ast.Constraint, error) {
-	// Set charset.
-	if len(colDef.Tp.Charset) == 0 {
-		switch colDef.Tp.Tp {
-		case mysql.TypeString, mysql.TypeVarchar, mysql.TypeVarString, mysql.TypeBlob, mysql.TypeTinyBlob, mysql.TypeMediumBlob, mysql.TypeLongBlob:
-			colDef.Tp.Charset, colDef.Tp.Collate = getDefaultCharsetAndCollate()
-		default:
-			colDef.Tp.Charset = charset.CharsetBin
-			colDef.Tp.Collate = charset.CharsetBin
-		}
-	}
-
-	col, cts, err := columnDefToCol(ctx, offset, colDef)
-	if err != nil {
-		return nil, nil, errors.Trace(err)
-	}
-
-	col.ID, err = d.genGlobalID()
-	if err != nil {
-		return nil, nil, errors.Trace(err)
-	}
-
-	return col, cts, nil
-}
-
-// columnDefToCol converts ColumnDef to Col and TableConstraints.
-func columnDefToCol(ctx context.Context, offset int, colDef *ast.ColumnDef) (*table.Column, []*ast.Constraint, error) {
-	constraints := []*ast.Constraint{}
-	col := &table.Column{
-		ColumnInfo: model.ColumnInfo{
-			Offset:    offset,
-			Name:      colDef.Name.Name,
-			FieldType: *colDef.Tp,
-		},
-	}
-
-	// Check and set TimestampFlag and OnUpdateNowFlag.
-	if col.Tp == mysql.TypeTimestamp {
-		col.Flag |= mysql.TimestampFlag
-		col.Flag |= mysql.OnUpdateNowFlag
-		col.Flag |= mysql.NotNullFlag
-	}
-
-	// If flen is not assigned, assigned it by type.
-	if col.Flen == types.UnspecifiedLength {
-		col.Flen = mysql.GetDefaultFieldLength(col.Tp)
-	}
-	if col.Decimal == types.UnspecifiedLength {
-		col.Decimal = mysql.GetDefaultDecimal(col.Tp)
-	}
-
-	setOnUpdateNow := false
-	hasDefaultValue := false
-	if colDef.Options != nil {
-		keys := []*ast.IndexColName{
-			{
-				Column: colDef.Name,
-				Length: colDef.Tp.Flen,
-			},
-		}
-		for _, v := range colDef.Options {
-			switch v.Tp {
-			case ast.ColumnOptionNotNull:
-				col.Flag |= mysql.NotNullFlag
-			case ast.ColumnOptionNull:
-				col.Flag &= ^uint(mysql.NotNullFlag)
-				removeOnUpdateNowFlag(col)
-			case ast.ColumnOptionAutoIncrement:
-				col.Flag |= mysql.AutoIncrementFlag
-			case ast.ColumnOptionPrimaryKey:
-				constraint := &ast.Constraint{Tp: ast.ConstraintPrimaryKey, Keys: keys}
-				constraints = append(constraints, constraint)
-				col.Flag |= mysql.PriKeyFlag
-			case ast.ColumnOptionUniq:
-				constraint := &ast.Constraint{Tp: ast.ConstraintUniq, Name: colDef.Name.Name.O, Keys: keys}
-				constraints = append(constraints, constraint)
-				col.Flag |= mysql.UniqueKeyFlag
-			case ast.ColumnOptionIndex:
-				constraint := &ast.Constraint{Tp: ast.ConstraintIndex, Name: colDef.Name.Name.O, Keys: keys}
-				constraints = append(constraints, constraint)
-			case ast.ColumnOptionUniqIndex:
-				constraint := &ast.Constraint{Tp: ast.ConstraintUniqIndex, Name: colDef.Name.Name.O, Keys: keys}
-				constraints = append(constraints, constraint)
-				col.Flag |= mysql.UniqueKeyFlag
-			case ast.ColumnOptionKey:
-				constraint := &ast.Constraint{Tp: ast.ConstraintKey, Name: colDef.Name.Name.O, Keys: keys}
-				constraints = append(constraints, constraint)
-			case ast.ColumnOptionUniqKey:
-				constraint := &ast.Constraint{Tp: ast.ConstraintUniqKey, Name: colDef.Name.Name.O, Keys: keys}
-				constraints = append(constraints, constraint)
-				col.Flag |= mysql.UniqueKeyFlag
-			case ast.ColumnOptionDefaultValue:
-				value, err := getDefaultValue(ctx, v, colDef.Tp.Tp, colDef.Tp.Decimal)
-				if err != nil {
-					return nil, nil, ErrColumnBadNull.Gen("invalid default value - %s", err)
-				}
-				col.DefaultValue = value
-				hasDefaultValue = true
-				removeOnUpdateNowFlag(col)
-			case ast.ColumnOptionOnUpdate:
-				if !evaluator.IsCurrentTimeExpr(v.Expr) {
-					return nil, nil, ErrInvalidOnUpdate.Gen("invalid ON UPDATE for - %s", col.Name)
-				}
-
-				col.Flag |= mysql.OnUpdateNowFlag
-				setOnUpdateNow = true
-			case ast.ColumnOptionComment:
-				value, err := evaluator.Eval(ctx, v.Expr)
-				if err != nil {
-					return nil, nil, errors.Trace(err)
-				}
-				col.Comment, err = value.ToString()
-				if err != nil {
-					return nil, nil, errors.Trace(err)
-				}
-			case ast.ColumnOptionFulltext:
-				// Do nothing.
-			}
-		}
-	}
-
-	setTimestampDefaultValue(col, hasDefaultValue, setOnUpdateNow)
-
-	// Set `NoDefaultValueFlag` if this field doesn't have a default value and
-	// it is `not null` and not an `AUTO_INCREMENT` field or `TIMESTAMP` field.
-	setNoDefaultValueFlag(col, hasDefaultValue)
-
-	err := checkDefaultValue(col, hasDefaultValue)
-	if err != nil {
-		return nil, nil, errors.Trace(err)
-	}
-	if col.Charset == charset.CharsetBin {
-		col.Flag |= mysql.BinaryFlag
-	}
-	return col, constraints, nil
-}
-
-func getDefaultValue(ctx context.Context, c *ast.ColumnOption, tp byte, fsp int) (interface{}, error) {
-	if tp == mysql.TypeTimestamp || tp == mysql.TypeDatetime {
-		vd, err := evaluator.GetTimeValue(ctx, c.Expr, tp, fsp)
-		value := vd.GetValue()
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-
-		// Value is nil means `default null`.
-		if value == nil {
-			return nil, nil
-		}
-
-		// If value is mysql.Time, convert it to string.
-		if vv, ok := value.(mysql.Time); ok {
-			return vv.String(), nil
-		}
-
-		return value, nil
-	}
-	v, err := evaluator.Eval(ctx, c.Expr)
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-	return v.GetValue(), nil
-}
-
-func removeOnUpdateNowFlag(c *table.Column) {
-	// For timestamp Col, if it is set null or default value,
-	// OnUpdateNowFlag should be removed.
-	if mysql.HasTimestampFlag(c.Flag) {
-		c.Flag &= ^uint(mysql.OnUpdateNowFlag)
-	}
-}
-
-func setTimestampDefaultValue(c *table.Column, hasDefaultValue bool, setOnUpdateNow bool) {
-	if hasDefaultValue {
-		return
-	}
-
-	// For timestamp Col, if is not set default value or not set null, use current timestamp.
-	if mysql.HasTimestampFlag(c.Flag) && mysql.HasNotNullFlag(c.Flag) {
-		if setOnUpdateNow {
-			c.DefaultValue = evaluator.ZeroTimestamp
-		} else {
-			c.DefaultValue = evaluator.CurrentTimestamp
-		}
-	}
-}
-
-func setNoDefaultValueFlag(c *table.Column, hasDefaultValue bool) {
-	if hasDefaultValue {
-		return
-	}
-
-	if !mysql.HasNotNullFlag(c.Flag) {
-		return
-	}
-
-	// Check if it is an `AUTO_INCREMENT` field or `TIMESTAMP` field.
-	if !mysql.HasAutoIncrementFlag(c.Flag) && !mysql.HasTimestampFlag(c.Flag) {
-		c.Flag |= mysql.NoDefaultValueFlag
-	}
-}
-
-func checkDefaultValue(c *table.Column, hasDefaultValue bool) error {
-	if !hasDefaultValue {
-		return nil
-	}
-
-	if c.DefaultValue != nil {
-		return nil
-	}
-
-	// Set not null but default null is invalid.
-	if mysql.HasNotNullFlag(c.Flag) {
-		return ErrColumnBadNull.Gen("invalid default value for %s", c.Name)
-	}
-
-	return nil
-}
-
-func checkDuplicateColumn(colDefs []*ast.ColumnDef) error {
-	colNames := map[string]bool{}
-	for _, colDef := range colDefs {
-		nameLower := colDef.Name.Name.O
-		if colNames[nameLower] {
-			return infoschema.ErrColumnExists.Gen("duplicate column %s", colDef.Name)
-		}
-		colNames[nameLower] = true
-	}
-	return nil
-}
-
-func checkTooLongColumn(colDefs []*ast.ColumnDef) error {
-	for _, colDef := range colDefs {
-		if len(colDef.Name.Name.O) > mysql.MaxColumnNameLength {
-			return ErrTooLongIdent.Gen("too long column %s", colDef.Name.Name.L)
-		}
-	}
-	return nil
-}
-
-func checkDuplicateConstraint(namesMap map[string]bool, name string, foreign bool) error {
-	if name == "" {
-		return nil
-	}
-	nameLower := strings.ToLower(name)
-	if namesMap[nameLower] {
-		if foreign {
-			return infoschema.ErrForeignKeyExists.Gen("CREATE TABLE: duplicate foreign key %s", name)
-		}
-		return infoschema.ErrIndexExists.Gen("CREATE TABLE: duplicate key %s", name)
-	}
-	namesMap[nameLower] = true
-	return nil
-}
-
-func setEmptyConstraintName(namesMap map[string]bool, constr *ast.Constraint, foreign bool) {
-	if constr.Name == "" && len(constr.Keys) > 0 {
-		colName := constr.Keys[0].Column.Name.L
-		constrName := colName
-		i := 2
-		for namesMap[constrName] {
-			// We loop forever until we find constrName that haven't been used.
-			if foreign {
-				constrName = fmt.Sprintf("fk_%s_%d", colName, i)
-			} else {
-				constrName = fmt.Sprintf("%s_%d", colName, i)
-			}
-			i++
-		}
-		constr.Name = constrName
-		namesMap[constrName] = true
-	}
-}
-
-func (d *ddl) checkConstraintNames(constraints []*ast.Constraint) error {
-	constrNames := map[string]bool{}
-	fkNames := map[string]bool{}
-
-	// Check not empty constraint name whether is duplicated.
-	for _, constr := range constraints {
-		if constr.Tp == ast.ConstraintForeignKey {
-			err := checkDuplicateConstraint(fkNames, constr.Name, true)
-			if err != nil {
-				return errors.Trace(err)
-			}
-		} else {
-			err := checkDuplicateConstraint(constrNames, constr.Name, false)
-			if err != nil {
-				return errors.Trace(err)
-			}
-		}
-	}
-
-	// Set empty constraint names.
-	for _, constr := range constraints {
-		if constr.Tp == ast.ConstraintForeignKey {
-			setEmptyConstraintName(fkNames, constr, true)
-		} else {
-			setEmptyConstraintName(constrNames, constr, false)
-		}
-	}
-
-	return nil
-}
-
-func (d *ddl) buildTableInfo(tableName model.CIStr, cols []*table.Column, constraints []*ast.Constraint) (tbInfo *model.TableInfo, err error) {
-	tbInfo = &model.TableInfo{
-		Name: tableName,
-	}
-	tbInfo.ID, err = d.genGlobalID()
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-	for _, v := range cols {
-		tbInfo.Columns = append(tbInfo.Columns, &v.ColumnInfo)
-	}
-	for _, constr := range constraints {
-		if constr.Tp == ast.ConstraintForeignKey {
-			for _, fk := range tbInfo.ForeignKeys {
-				if fk.Name.L == strings.ToLower(constr.Name) {
-					return nil, infoschema.ErrForeignKeyExists.Gen("foreign key %s already exists.", constr.Name)
-				}
-			}
-			var fk model.FKInfo
-			fk.Name = model.NewCIStr(constr.Name)
-			fk.RefTable = constr.Refer.Table.Name
-			fk.State = model.StatePublic
-			for _, key := range constr.Keys {
-				fk.Cols = append(fk.Cols, key.Column.Name)
-			}
-			for _, key := range constr.Refer.IndexColNames {
-				fk.RefCols = append(fk.RefCols, key.Column.Name)
-			}
-			fk.OnDelete = int(constr.Refer.OnDelete.ReferOpt)
-			fk.OnUpdate = int(constr.Refer.OnUpdate.ReferOpt)
-			if len(fk.Cols) != len(fk.RefCols) {
-				return nil, infoschema.ErrForeignKeyNotMatch.Gen("foreign key not match keys len %d, refkeys len %d .", len(fk.Cols), len(fk.RefCols))
-			}
-			if len(fk.Cols) == 0 {
-				return nil, infoschema.ErrForeignKeyNotMatch.Gen("foreign key should have one key at least.")
-			}
-			tbInfo.ForeignKeys = append(tbInfo.ForeignKeys, &fk)
+			log.Errorf("[ddl] get history DDL job err %v, check again", err)
+			continue
+		} else if historyJob == nil {
+			log.Debugf("[ddl] DDL job ID:%d is not in history, maybe not run", jobID)
 			continue
 		}
-		if constr.Tp == ast.ConstraintPrimaryKey {
-			if len(constr.Keys) == 1 {
-				key := constr.Keys[0]
-				col := table.FindCol(cols, key.Column.Name.O)
-				if col == nil {
-					return nil, infoschema.ErrColumnNotExists.Gen("no such column: %v", key)
-				}
-				switch col.Tp {
-				case mysql.TypeLong, mysql.TypeLonglong,
-					mysql.TypeTiny, mysql.TypeShort, mysql.TypeInt24:
-					tbInfo.PKIsHandle = true
-					// Avoid creating index for PK handle column.
-					continue
-				}
-			}
+
+		// If a job is a history job, the state must be JobStateSynced or JobStateRollbackDone or JobStateCancelled.
+		if historyJob.IsSynced() {
+			log.Infof("[ddl] DDL job ID:%d is finished", jobID)
+			return nil
 		}
 
-		// 1. check if the column is exists
-		// 2. add index
-		indexColumns := make([]*model.IndexColumn, 0, len(constr.Keys))
-		for _, key := range constr.Keys {
-			col := table.FindCol(cols, key.Column.Name.O)
-			if col == nil {
-				return nil, infoschema.ErrColumnNotExists.Gen("no such column: %v", key)
-			}
-			indexColumns = append(indexColumns, &model.IndexColumn{
-				Name:   key.Column.Name,
-				Offset: col.Offset,
-				Length: key.Length,
-			})
+		if historyJob.Error != nil {
+			return errors.Trace(historyJob.Error)
 		}
-		idxInfo := &model.IndexInfo{
-			Name:    model.NewCIStr(constr.Name),
-			Columns: indexColumns,
-			State:   model.StatePublic,
-		}
-		switch constr.Tp {
-		case ast.ConstraintPrimaryKey:
-			idxInfo.Unique = true
-			idxInfo.Primary = true
-			idxInfo.Name = model.NewCIStr(table.PrimaryKeyName)
-		case ast.ConstraintUniq, ast.ConstraintUniqKey, ast.ConstraintUniqIndex:
-			idxInfo.Unique = true
-		}
-		if constr.Option != nil {
-			idxInfo.Comment = constr.Option.Comment
-			idxInfo.Tp = constr.Option.Tp
-		} else {
-			// Use btree as default index type.
-			idxInfo.Tp = model.IndexTypeBtree
-		}
-		idxInfo.ID, err = d.genGlobalID()
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-		tbInfo.Indices = append(tbInfo.Indices, idxInfo)
+		panic("When the state is JobStateRollbackDone or JobStateCancelled, historyJob.Error should never be nil")
 	}
-	return
-}
-
-func (d *ddl) CreateTable(ctx context.Context, ident ast.Ident, colDefs []*ast.ColumnDef,
-	constraints []*ast.Constraint, options []*ast.TableOption) (err error) {
-	is := d.GetInformationSchema()
-	schema, ok := is.SchemaByName(ident.Schema)
-	if !ok {
-		return infoschema.ErrDatabaseNotExists.Gen("database %s not exists", ident.Schema)
-	}
-	if is.TableExists(ident.Schema, ident.Name) {
-		return errors.Trace(infoschema.ErrTableExists)
-	}
-	if err = checkTooLongTable(ident.Name); err != nil {
-		return errors.Trace(err)
-	}
-	if err = checkDuplicateColumn(colDefs); err != nil {
-		return errors.Trace(err)
-	}
-	if err = checkTooLongColumn(colDefs); err != nil {
-		return errors.Trace(err)
-	}
-
-	cols, newConstraints, err := d.buildColumnsAndConstraints(ctx, colDefs, constraints)
-	if err != nil {
-		return errors.Trace(err)
-	}
-
-	err = d.checkConstraintNames(newConstraints)
-	if err != nil {
-		return errors.Trace(err)
-	}
-
-	tbInfo, err := d.buildTableInfo(ident.Name, cols, newConstraints)
-	if err != nil {
-		return errors.Trace(err)
-	}
-
-	job := &model.Job{
-		SchemaID: schema.ID,
-		TableID:  tbInfo.ID,
-		Type:     model.ActionCreateTable,
-		Args:     []interface{}{tbInfo},
-	}
-	// Handle Table Options
-
-	d.handleTableOptions(options, tbInfo, schema.ID)
-	err = d.doDDLJob(ctx, job)
-	if err == nil {
-		if tbInfo.AutoIncID > 1 {
-			// Default tableAutoIncID base is 0.
-			// If the first id is expected to greater than 1, we need to do rebase.
-			d.handleAutoIncID(tbInfo, schema.ID)
-		}
-	}
-	err = d.callHookOnChanged(err)
-	return errors.Trace(err)
-}
-
-// If create table with auto_increment option, we should rebase tableAutoIncID value.
-func (d *ddl) handleAutoIncID(tbInfo *model.TableInfo, schemaID int64) error {
-	alloc := autoid.NewAllocator(d.store, schemaID)
-	tbInfo.State = model.StatePublic
-	tb, err := table.TableFromMeta(alloc, tbInfo)
-	if err != nil {
-		return errors.Trace(err)
-	}
-	// The operation of the minus 1 to make sure that the current value doesn't be used,
-	// the next Alloc operation will get this value.
-	// Its behavior is consistent with MySQL.
-	if err = tb.RebaseAutoID(tbInfo.AutoIncID-1, false); err != nil {
-		return errors.Trace(err)
-	}
-	return nil
-}
-
-// Add create table options into TableInfo.
-func (d *ddl) handleTableOptions(options []*ast.TableOption, tbInfo *model.TableInfo, schemaID int64) {
-	for _, op := range options {
-		switch op.Tp {
-		case ast.TableOptionAutoIncrement:
-			tbInfo.AutoIncID = int64(op.UintValue)
-		case ast.TableOptionComment:
-			tbInfo.Comment = op.StrValue
-		case ast.TableOptionCharset:
-			tbInfo.Charset = op.StrValue
-		case ast.TableOptionCollate:
-			tbInfo.Charset = op.StrValue
-		}
-	}
-}
-
-func (d *ddl) AlterTable(ctx context.Context, ident ast.Ident, specs []*ast.AlterTableSpec) (err error) {
-	// now we only allow one schema changes at the same time.
-	if len(specs) != 1 {
-		return errRunMultiSchemaChanges
-	}
-
-	for _, spec := range specs {
-		switch spec.Tp {
-		case ast.AlterTableAddColumn:
-			err = d.AddColumn(ctx, ident, spec)
-		case ast.AlterTableDropColumn:
-			err = d.DropColumn(ctx, ident, spec.DropColumn.Name)
-		case ast.AlterTableDropIndex:
-			err = d.DropIndex(ctx, ident, model.NewCIStr(spec.Name))
-		case ast.AlterTableAddConstraint:
-			constr := spec.Constraint
-			switch spec.Constraint.Tp {
-			case ast.ConstraintKey, ast.ConstraintIndex:
-				err = d.CreateIndex(ctx, ident, false, model.NewCIStr(constr.Name), spec.Constraint.Keys)
-			case ast.ConstraintUniq, ast.ConstraintUniqIndex, ast.ConstraintUniqKey:
-				err = d.CreateIndex(ctx, ident, true, model.NewCIStr(constr.Name), spec.Constraint.Keys)
-			case ast.ConstraintForeignKey:
-				err = d.CreateForeignKey(ctx, ident, model.NewCIStr(constr.Name), spec.Constraint.Keys, spec.Constraint.Refer)
-			default:
-				// nothing to do now.
-			}
-		case ast.AlterTableDropForeignKey:
-			err = d.DropForeignKey(ctx, ident, model.NewCIStr(spec.Name))
-		default:
-			// nothing to do now.
-		}
-
-		if err != nil {
-			return errors.Trace(err)
-		}
-	}
-
-	return nil
-}
-
-func checkColumnConstraint(constraints []*ast.ColumnOption) error {
-	for _, constraint := range constraints {
-		switch constraint.Tp {
-		case ast.ColumnOptionAutoIncrement, ast.ColumnOptionPrimaryKey, ast.ColumnOptionUniq, ast.ColumnOptionUniqKey:
-			return errUnsupportedAddColumn.Gen("unsupported add column constraint - %v", constraint.Tp)
-		}
-	}
-
-	return nil
-}
-
-// AddColumn will add a new column to the table.
-func (d *ddl) AddColumn(ctx context.Context, ti ast.Ident, spec *ast.AlterTableSpec) error {
-	// Check whether the added column constraints are supported.
-	err := checkColumnConstraint(spec.Column.Options)
-	if err != nil {
-		return errors.Trace(err)
-	}
-
-	is := d.infoHandle.Get()
-	schema, ok := is.SchemaByName(ti.Schema)
-	if !ok {
-		return errors.Trace(infoschema.ErrDatabaseNotExists)
-	}
-
-	t, err := is.TableByName(ti.Schema, ti.Name)
-	if err != nil {
-		return errors.Trace(infoschema.ErrTableNotExists)
-	}
-
-	// Check whether added column has existed.
-	colName := spec.Column.Name.Name.O
-	col := table.FindCol(t.Cols(), colName)
-	if col != nil {
-		return infoschema.ErrColumnExists.Gen("column %s already exists", colName)
-	}
-
-	if len(colName) > mysql.MaxColumnNameLength {
-		return ErrTooLongIdent.Gen("too long column %s", colName)
-	}
-
-	// ingore table constraints now, maybe return error later
-	// we use length(t.Cols()) as the default offset first, later we will change the
-	// column's offset later.
-	col, _, err = d.buildColumnAndConstraint(ctx, len(t.Cols()), spec.Column)
-	if err != nil {
-		return errors.Trace(err)
-	}
-
-	job := &model.Job{
-		SchemaID: schema.ID,
-		TableID:  t.Meta().ID,
-		Type:     model.ActionAddColumn,
-		Args:     []interface{}{&col.ColumnInfo, spec.Position, 0},
-	}
-
-	err = d.doDDLJob(ctx, job)
-	err = d.callHookOnChanged(err)
-	return errors.Trace(err)
-}
-
-// DropColumn will drop a column from the table, now we don't support drop the column with index covered.
-func (d *ddl) DropColumn(ctx context.Context, ti ast.Ident, colName model.CIStr) error {
-	is := d.infoHandle.Get()
-	schema, ok := is.SchemaByName(ti.Schema)
-	if !ok {
-		return errors.Trace(infoschema.ErrDatabaseNotExists)
-	}
-
-	t, err := is.TableByName(ti.Schema, ti.Name)
-	if err != nil {
-		return errors.Trace(infoschema.ErrTableNotExists)
-	}
-
-	// Check whether dropped column has existed.
-	col := table.FindCol(t.Cols(), colName.L)
-	if col == nil {
-		return infoschema.ErrColumnNotExists.Gen("column %s doesn’t exist", colName.L)
-	}
-
-	job := &model.Job{
-		SchemaID: schema.ID,
-		TableID:  t.Meta().ID,
-		Type:     model.ActionDropColumn,
-		Args:     []interface{}{colName},
-	}
-
-	err = d.doDDLJob(ctx, job)
-	err = d.callHookOnChanged(err)
-	return errors.Trace(err)
-}
-
-// DropTable will proceed even if some table in the list does not exists.
-func (d *ddl) DropTable(ctx context.Context, ti ast.Ident) (err error) {
-	is := d.GetInformationSchema()
-	schema, ok := is.SchemaByName(ti.Schema)
-	if !ok {
-		return infoschema.ErrDatabaseNotExists.Gen("database %s not exists", ti.Schema)
-	}
-
-	tb, err := is.TableByName(ti.Schema, ti.Name)
-	if err != nil {
-		return errors.Trace(infoschema.ErrTableNotExists)
-	}
-
-	job := &model.Job{
-		SchemaID: schema.ID,
-		TableID:  tb.Meta().ID,
-		Type:     model.ActionDropTable,
-	}
-
-	err = d.doDDLJob(ctx, job)
-	err = d.callHookOnChanged(err)
-	return errors.Trace(err)
-}
-
-func (d *ddl) TruncateTable(ctx context.Context, ti ast.Ident) error {
-	is := d.GetInformationSchema()
-	schema, ok := is.SchemaByName(ti.Schema)
-	if !ok {
-		return infoschema.ErrDatabaseNotExists.Gen("database %s not exists", ti.Schema)
-	}
-	tb, err := is.TableByName(ti.Schema, ti.Name)
-	if err != nil {
-		return errors.Trace(infoschema.ErrTableNotExists)
-	}
-	newTableID, err := d.genGlobalID()
-	if err != nil {
-		return errors.Trace(err)
-	}
-	job := &model.Job{
-		SchemaID: schema.ID,
-		TableID:  tb.Meta().ID,
-		Type:     model.ActionTruncateTable,
-		Args:     []interface{}{newTableID},
-	}
-	err = d.doDDLJob(ctx, job)
-	err = d.callHookOnChanged(err)
-	return errors.Trace(err)
-}
-
-func (d *ddl) CreateIndex(ctx context.Context, ti ast.Ident, unique bool, indexName model.CIStr, idxColNames []*ast.IndexColName) error {
-	is := d.infoHandle.Get()
-	schema, ok := is.SchemaByName(ti.Schema)
-	if !ok {
-		return infoschema.ErrDatabaseNotExists.Gen("database %s not exists", ti.Schema)
-	}
-
-	t, err := is.TableByName(ti.Schema, ti.Name)
-	if err != nil {
-		return errors.Trace(infoschema.ErrTableNotExists)
-	}
-	indexID, err := d.genGlobalID()
-	if err != nil {
-		return errors.Trace(err)
-	}
-
-	job := &model.Job{
-		SchemaID: schema.ID,
-		TableID:  t.Meta().ID,
-		Type:     model.ActionAddIndex,
-		Args:     []interface{}{unique, indexName, indexID, idxColNames},
-	}
-
-	err = d.doDDLJob(ctx, job)
-	err = d.callHookOnChanged(err)
-	return errors.Trace(err)
-}
-
-func (d *ddl) buildFKInfo(fkName model.CIStr, keys []*ast.IndexColName, refer *ast.ReferenceDef) (*model.FKInfo, error) {
-	fkID, err := d.genGlobalID()
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-
-	var fkInfo model.FKInfo
-	fkInfo.ID = fkID
-	fkInfo.Name = fkName
-	fkInfo.RefTable = refer.Table.Name
-
-	fkInfo.Cols = make([]model.CIStr, len(keys))
-	for i, key := range keys {
-		fkInfo.Cols[i] = key.Column.Name
-	}
-
-	fkInfo.RefCols = make([]model.CIStr, len(refer.IndexColNames))
-	for i, key := range refer.IndexColNames {
-		fkInfo.RefCols[i] = key.Column.Name
-	}
-
-	fkInfo.OnDelete = int(refer.OnDelete.ReferOpt)
-	fkInfo.OnUpdate = int(refer.OnUpdate.ReferOpt)
-
-	return &fkInfo, nil
-
-}
-
-func (d *ddl) CreateForeignKey(ctx context.Context, ti ast.Ident, fkName model.CIStr, keys []*ast.IndexColName, refer *ast.ReferenceDef) error {
-	is := d.infoHandle.Get()
-	schema, ok := is.SchemaByName(ti.Schema)
-	if !ok {
-		return infoschema.ErrDatabaseNotExists.Gen("database %s not exists", ti.Schema)
-	}
-
-	t, err := is.TableByName(ti.Schema, ti.Name)
-	if err != nil {
-		return errors.Trace(infoschema.ErrTableNotExists)
-	}
-
-	fkInfo, err := d.buildFKInfo(fkName, keys, refer)
-	if err != nil {
-		return errors.Trace(err)
-	}
-
-	job := &model.Job{
-		SchemaID: schema.ID,
-		TableID:  t.Meta().ID,
-		Type:     model.ActionAddForeignKey,
-		Args:     []interface{}{fkInfo},
-	}
-
-	err = d.doDDLJob(ctx, job)
-	err = d.callHookOnChanged(err)
-	return errors.Trace(err)
-
-}
-
-func (d *ddl) DropForeignKey(ctx context.Context, ti ast.Ident, fkName model.CIStr) error {
-	is := d.infoHandle.Get()
-	schema, ok := is.SchemaByName(ti.Schema)
-	if !ok {
-		return infoschema.ErrDatabaseNotExists.Gen("database %s not exists", ti.Schema)
-	}
-
-	t, err := is.TableByName(ti.Schema, ti.Name)
-	if err != nil {
-		return errors.Trace(infoschema.ErrTableNotExists)
-	}
-
-	job := &model.Job{
-		SchemaID: schema.ID,
-		TableID:  t.Meta().ID,
-		Type:     model.ActionDropForeignKey,
-		Args:     []interface{}{fkName},
-	}
-
-	err = d.doDDLJob(ctx, job)
-	err = d.callHookOnChanged(err)
-	return errors.Trace(err)
-}
-
-func (d *ddl) DropIndex(ctx context.Context, ti ast.Ident, indexName model.CIStr) error {
-	is := d.infoHandle.Get()
-	schema, ok := is.SchemaByName(ti.Schema)
-	if !ok {
-		return errors.Trace(infoschema.ErrDatabaseNotExists)
-	}
-
-	t, err := is.TableByName(ti.Schema, ti.Name)
-	if err != nil {
-		return errors.Trace(infoschema.ErrTableNotExists)
-	}
-
-	job := &model.Job{
-		SchemaID: schema.ID,
-		TableID:  t.Meta().ID,
-		Type:     model.ActionDropIndex,
-		Args:     []interface{}{indexName},
-	}
-
-	err = d.doDDLJob(ctx, job)
-	err = d.callHookOnChanged(err)
-	return errors.Trace(err)
 }
 
 func (d *ddl) callHookOnChanged(err error) error {
-	d.hookMu.Lock()
-	defer d.hookMu.Unlock()
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 
-	err = d.hook.OnChanged(err)
+	err = d.mu.hook.OnChanged(err)
 	return errors.Trace(err)
 }
 
-func (d *ddl) setHook(h Callback) {
-	d.hookMu.Lock()
-	defer d.hookMu.Unlock()
-
-	d.hook = h
+// SetBinlogClient implements DDL.SetBinlogClient interface.
+func (d *ddl) SetBinlogClient(binlogCli *pumpcli.PumpsClient) {
+	d.binlogCli = binlogCli
 }
 
-// findCol finds column in cols by name.
-func findCol(cols []*model.ColumnInfo, name string) *model.ColumnInfo {
-	name = strings.ToLower(name)
-	for _, col := range cols {
-		if col.Name.L == name {
-			return col
-		}
-	}
+// GetHook implements DDL.GetHook interface.
+func (d *ddl) GetHook() Callback {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 
-	return nil
+	return d.mu.hook
 }
 
 // DDL error codes.
@@ -1275,11 +616,17 @@ const (
 	codeInvalidWorker         terror.ErrCode = 1
 	codeNotOwner                             = 2
 	codeInvalidDDLJob                        = 3
-	codeInvalidBgJob                         = 4
 	codeInvalidJobFlag                       = 5
 	codeRunMultiSchemaChanges                = 6
 	codeWaitReorgTimeout                     = 7
 	codeInvalidStoreVer                      = 8
+	codeUnknownTypeLength                    = 9
+	codeUnknownFractionLength                = 10
+	codeInvalidJobVersion                    = 11
+	codeCancelledDDLJob                      = 12
+	codeInvalidRanges                        = 13
+	codeReorgWorkerPanic                     = 14
+	codeCantDecodeIndex                      = 15
 
 	codeInvalidDBState         = 100
 	codeInvalidTableState      = 101
@@ -1287,29 +634,127 @@ const (
 	codeInvalidIndexState      = 103
 	codeInvalidForeignKeyState = 104
 
-	codeCantDropColWithIndex = 201
-	codeUnsupportedAddColumn = 202
+	codeCantDropColWithIndex               = 201
+	codeUnsupportedAddColumn               = 202
+	codeUnsupportedModifyColumn            = 203
+	codeUnsupportedDropPKHandle            = 204
+	codeUnsupportedCharset                 = 205
+	codeUnsupportedModifyPrimaryKey        = 206
+	codeUnsupportedShardRowIDBits          = 207
+	codeUnsupportedAddPartition            = 208
+	codeUnsupportedCoalescePartition       = 209
+	codeUnsupportedModifyCharset           = 210
+	codeUnsupportedPartitionByRangeColumns = 211
 
-	codeBadNull              = 1048
-	codeTooLongIdent         = 1059
-	codeTooLongKey           = 1071
-	codeIncorrectPrefixKey   = 1089
-	codeCantRemoveAllFields  = 1090
-	codeCantDropFieldOrKey   = 1091
-	codeBlobKeyWithoutLength = 1170
-	codeInvalidOnUpdate      = 1294
+	codeFileNotFound                           = 1017
+	codeErrorOnRename                          = 1025
+	codeBadNull                                = mysql.ErrBadNull
+	codeBadField                               = 1054
+	codeTooLongIdent                           = 1059
+	codeDupKeyName                             = 1061
+	codeInvalidDefaultValue                    = mysql.ErrInvalidDefault
+	codeTooLongKey                             = 1071
+	codeKeyColumnDoesNotExits                  = mysql.ErrKeyColumnDoesNotExits
+	codeIncorrectPrefixKey                     = 1089
+	codeCantRemoveAllFields                    = 1090
+	codeCantDropFieldOrKey                     = 1091
+	codeBlobCantHaveDefault                    = 1101
+	codeWrongDBName                            = 1102
+	codeWrongTableName                         = 1103
+	codeTooManyFields                          = 1117
+	codeInvalidUseOfNull                       = 1138
+	codeWrongColumnName                        = 1166
+	codeWrongKeyColumn                         = 1167
+	codeBlobKeyWithoutLength                   = 1170
+	codeInvalidOnUpdate                        = 1294
+	codeErrWrongObject                         = terror.ErrCode(mysql.ErrWrongObject)
+	codeViewWrongList                          = 1353
+	codeUnsupportedOnGeneratedColumn           = 3106
+	codeGeneratedColumnNonPrior                = 3107
+	codeDependentByGeneratedColumn             = 3108
+	codeJSONUsedAsKey                          = 3152
+	codeWrongNameForIndex                      = terror.ErrCode(mysql.ErrWrongNameForIndex)
+	codeErrTooLongIndexComment                 = terror.ErrCode(mysql.ErrTooLongIndexComment)
+	codeUnknownCharacterSet                    = terror.ErrCode(mysql.ErrUnknownCharacterSet)
+	codeCantCreateTable                        = terror.ErrCode(mysql.ErrCantCreateTable)
+	codeTableMustHaveColumns                   = terror.ErrCode(mysql.ErrTableMustHaveColumns)
+	codePartitionsMustBeDefined                = terror.ErrCode(mysql.ErrPartitionsMustBeDefined)
+	codePartitionMgmtOnNonpartitioned          = terror.ErrCode(mysql.ErrPartitionMgmtOnNonpartitioned)
+	codeDropPartitionNonExistent               = terror.ErrCode(mysql.ErrDropPartitionNonExistent)
+	codeSameNamePartition                      = terror.ErrCode(mysql.ErrSameNamePartition)
+	codeRangeNotIncreasing                     = terror.ErrCode(mysql.ErrRangeNotIncreasing)
+	codePartitionMaxvalue                      = terror.ErrCode(mysql.ErrPartitionMaxvalue)
+	codeErrTooManyValues                       = terror.ErrCode(mysql.ErrTooManyValues)
+	codeDropLastPartition                      = terror.ErrCode(mysql.ErrDropLastPartition)
+	codeTooManyPartitions                      = terror.ErrCode(mysql.ErrTooManyPartitions)
+	codeNoParts                                = terror.ErrCode(mysql.ErrNoParts)
+	codePartitionFunctionIsNotAllowed          = terror.ErrCode(mysql.ErrPartitionFunctionIsNotAllowed)
+	codeErrPartitionFuncNotAllowed             = terror.ErrCode(mysql.ErrPartitionFuncNotAllowed)
+	codeErrFieldTypeNotAllowedAsPartitionField = terror.ErrCode(mysql.ErrFieldTypeNotAllowedAsPartitionField)
+	codeUniqueKeyNeedAllFieldsInPf             = terror.ErrCode(mysql.ErrUniqueKeyNeedAllFieldsInPf)
+	codePrimaryCantHaveNull                    = terror.ErrCode(mysql.ErrPrimaryCantHaveNull)
+	codeWrongExprInPartitionFunc               = terror.ErrCode(mysql.ErrWrongExprInPartitionFunc)
+	codeWarnDataTruncated                      = terror.ErrCode(mysql.WarnDataTruncated)
+	codeCoalesceOnlyOnHashPartition            = terror.ErrCode(mysql.ErrCoalesceOnlyOnHashPartition)
+	codeUnknownPartition                       = terror.ErrCode(mysql.ErrUnknownPartition)
+	codeErrGeneratedColumnRefAutoInc           = terror.ErrCode(mysql.ErrGeneratedColumnRefAutoInc)
+	codeNotSupportedAlterOperation             = terror.ErrCode(mysql.ErrAlterOperationNotSupportedReason)
 )
 
 func init() {
 	ddlMySQLErrCodes := map[terror.ErrCode]uint16{
-		codeBadNull:              mysql.ErrBadNull,
-		codeCantRemoveAllFields:  mysql.ErrCantRemoveAllFields,
-		codeCantDropFieldOrKey:   mysql.ErrCantDropFieldOrKey,
-		codeInvalidOnUpdate:      mysql.ErrInvalidOnUpdate,
-		codeBlobKeyWithoutLength: mysql.ErrBlobKeyWithoutLength,
-		codeIncorrectPrefixKey:   mysql.ErrWrongSubKey,
-		codeTooLongIdent:         mysql.ErrTooLongIdent,
-		codeTooLongKey:           mysql.ErrTooLongKey,
+		codeBadNull:                                mysql.ErrBadNull,
+		codeCantRemoveAllFields:                    mysql.ErrCantRemoveAllFields,
+		codeCantDropFieldOrKey:                     mysql.ErrCantDropFieldOrKey,
+		codeInvalidOnUpdate:                        mysql.ErrInvalidOnUpdate,
+		codeBlobKeyWithoutLength:                   mysql.ErrBlobKeyWithoutLength,
+		codeIncorrectPrefixKey:                     mysql.ErrWrongSubKey,
+		codeTooLongIdent:                           mysql.ErrTooLongIdent,
+		codeTooLongKey:                             mysql.ErrTooLongKey,
+		codeKeyColumnDoesNotExits:                  mysql.ErrKeyColumnDoesNotExits,
+		codeDupKeyName:                             mysql.ErrDupKeyName,
+		codeWrongDBName:                            mysql.ErrWrongDBName,
+		codeWrongTableName:                         mysql.ErrWrongTableName,
+		codeFileNotFound:                           mysql.ErrFileNotFound,
+		codeErrorOnRename:                          mysql.ErrErrorOnRename,
+		codeBadField:                               mysql.ErrBadField,
+		codeInvalidUseOfNull:                       mysql.ErrInvalidUseOfNull,
+		codeUnsupportedOnGeneratedColumn:           mysql.ErrUnsupportedOnGeneratedColumn,
+		codeGeneratedColumnNonPrior:                mysql.ErrGeneratedColumnNonPrior,
+		codeDependentByGeneratedColumn:             mysql.ErrDependentByGeneratedColumn,
+		codeJSONUsedAsKey:                          mysql.ErrJSONUsedAsKey,
+		codeBlobCantHaveDefault:                    mysql.ErrBlobCantHaveDefault,
+		codeWrongColumnName:                        mysql.ErrWrongColumnName,
+		codeWrongKeyColumn:                         mysql.ErrWrongKeyColumn,
+		codeWrongNameForIndex:                      mysql.ErrWrongNameForIndex,
+		codeTableMustHaveColumns:                   mysql.ErrTableMustHaveColumns,
+		codeTooManyFields:                          mysql.ErrTooManyFields,
+		codeErrTooLongIndexComment:                 mysql.ErrTooLongIndexComment,
+		codeViewWrongList:                          mysql.ErrViewWrongList,
+		codeUnknownCharacterSet:                    mysql.ErrUnknownCharacterSet,
+		codePartitionsMustBeDefined:                mysql.ErrPartitionsMustBeDefined,
+		codePartitionMgmtOnNonpartitioned:          mysql.ErrPartitionMgmtOnNonpartitioned,
+		codeDropPartitionNonExistent:               mysql.ErrDropPartitionNonExistent,
+		codeSameNamePartition:                      mysql.ErrSameNamePartition,
+		codeRangeNotIncreasing:                     mysql.ErrRangeNotIncreasing,
+		codePartitionMaxvalue:                      mysql.ErrPartitionMaxvalue,
+		codeErrTooManyValues:                       mysql.ErrTooManyValues,
+		codeDropLastPartition:                      mysql.ErrDropLastPartition,
+		codeTooManyPartitions:                      mysql.ErrTooManyPartitions,
+		codeNoParts:                                mysql.ErrNoParts,
+		codePartitionFunctionIsNotAllowed:          mysql.ErrPartitionFunctionIsNotAllowed,
+		codeErrPartitionFuncNotAllowed:             mysql.ErrPartitionFuncNotAllowed,
+		codeErrFieldTypeNotAllowedAsPartitionField: mysql.ErrFieldTypeNotAllowedAsPartitionField,
+		codeUniqueKeyNeedAllFieldsInPf:             mysql.ErrUniqueKeyNeedAllFieldsInPf,
+		codePrimaryCantHaveNull:                    mysql.ErrPrimaryCantHaveNull,
+		codeWrongExprInPartitionFunc:               mysql.ErrWrongExprInPartitionFunc,
+		codeWarnDataTruncated:                      mysql.WarnDataTruncated,
+		codeCoalesceOnlyOnHashPartition:            mysql.ErrCoalesceOnlyOnHashPartition,
+		codeUnknownPartition:                       mysql.ErrUnknownPartition,
+		codeNotSupportedAlterOperation:             mysql.ErrAlterOperationNotSupportedReason,
+		codeErrWrongObject:                         mysql.ErrWrongObject,
+		codeInvalidDefaultValue:                    mysql.ErrInvalidDefault,
+		codeErrGeneratedColumnRefAutoInc:           mysql.ErrGeneratedColumnRefAutoInc,
 	}
 	terror.ErrClassToMySQLCodes[terror.ClassDDL] = ddlMySQLErrCodes
 }

@@ -14,9 +14,11 @@
 package tikv
 
 import (
-	"github.com/juju/errors"
+	"context"
+
+	"github.com/pingcap/errors"
 	"github.com/pingcap/kvproto/pkg/metapb"
-	"github.com/pingcap/pd/pd-client"
+	"github.com/pingcap/pd/client"
 	"github.com/pingcap/tidb/util/codec"
 )
 
@@ -26,28 +28,53 @@ type codecPDClient struct {
 
 // GetRegion encodes the key before send requests to pd-server and decodes the
 // returned StartKey && EndKey from pd-server.
-func (c *codecPDClient) GetRegion(key []byte) (*metapb.Region, *metapb.Peer, error) {
+func (c *codecPDClient) GetRegion(ctx context.Context, key []byte) (*metapb.Region, *metapb.Peer, error) {
 	encodedKey := codec.EncodeBytes([]byte(nil), key)
-	region, peer, err := c.Client.GetRegion(encodedKey)
+	region, peer, err := c.Client.GetRegion(ctx, encodedKey)
+	return processRegionResult(region, peer, err)
+}
+
+func (c *codecPDClient) GetPrevRegion(ctx context.Context, key []byte) (*metapb.Region, *metapb.Peer, error) {
+	encodedKey := codec.EncodeBytes([]byte(nil), key)
+	region, peer, err := c.Client.GetPrevRegion(ctx, encodedKey)
+	return processRegionResult(region, peer, err)
+}
+
+// GetRegionByID encodes the key before send requests to pd-server and decodes the
+// returned StartKey && EndKey from pd-server.
+func (c *codecPDClient) GetRegionByID(ctx context.Context, regionID uint64) (*metapb.Region, *metapb.Peer, error) {
+	region, peer, err := c.Client.GetRegionByID(ctx, regionID)
+	return processRegionResult(region, peer, err)
+}
+
+func processRegionResult(region *metapb.Region, peer *metapb.Peer, err error) (*metapb.Region, *metapb.Peer, error) {
 	if err != nil {
 		return nil, nil, errors.Trace(err)
 	}
 	if region == nil {
 		return nil, nil, nil
 	}
-	if len(region.StartKey) != 0 {
-		_, decoded, err := codec.DecodeBytes(region.StartKey)
-		if err != nil {
-			return nil, nil, errors.Trace(err)
-		}
-		region.StartKey = decoded
-	}
-	if len(region.EndKey) != 0 {
-		_, decoded, err := codec.DecodeBytes(region.EndKey)
-		if err != nil {
-			return nil, nil, errors.Trace(err)
-		}
-		region.EndKey = decoded
+	err = decodeRegionMetaKey(region)
+	if err != nil {
+		return nil, nil, errors.Trace(err)
 	}
 	return region, peer, nil
+}
+
+func decodeRegionMetaKey(r *metapb.Region) error {
+	if len(r.StartKey) != 0 {
+		_, decoded, err := codec.DecodeBytes(r.StartKey, nil)
+		if err != nil {
+			return errors.Trace(err)
+		}
+		r.StartKey = decoded
+	}
+	if len(r.EndKey) != 0 {
+		_, decoded, err := codec.DecodeBytes(r.EndKey, nil)
+		if err != nil {
+			return errors.Trace(err)
+		}
+		r.EndKey = decoded
+	}
+	return nil
 }

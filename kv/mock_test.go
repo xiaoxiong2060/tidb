@@ -14,6 +14,8 @@
 package kv
 
 import (
+	"context"
+
 	. "github.com/pingcap/check"
 )
 
@@ -45,14 +47,13 @@ func (s testMockSuite) TestInterface(c *C) {
 	if transaction.IsReadOnly() {
 		transaction.Get(Key("lock"))
 		transaction.Set(Key("lock"), []byte{})
-		transaction.Seek(Key("lock"))
-		transaction.SeekReverse(Key("lock"))
+		transaction.Iter(Key("lock"), nil)
+		transaction.IterReverse(Key("lock"))
 	}
-	transaction.Commit()
+	transaction.Commit(context.Background())
 
 	transaction, err = storage.Begin()
 	c.Check(err, IsNil)
-	transaction.String()
 	err = transaction.Rollback()
 	c.Check(err, IsNil)
 

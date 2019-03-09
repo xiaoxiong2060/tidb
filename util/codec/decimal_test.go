@@ -15,9 +15,8 @@ package codec
 
 import (
 	. "github.com/pingcap/check"
-	"github.com/pingcap/tidb/mysql"
+	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/testleak"
-	"github.com/pingcap/tidb/util/types"
 )
 
 var _ = Suite(&testDecimalSuite{})
@@ -46,35 +45,45 @@ func (s *testDecimalSuite) TestDecimalCodec(c *C) {
 	}
 
 	for _, input := range inputs {
-		v := mysql.NewDecFromFloatForTest(input.Input)
-		b := EncodeDecimal([]byte{}, types.NewDatum(v))
-		_, d, err := DecodeDecimal(b)
+		v := types.NewDecFromFloatForTest(input.Input)
+		datum := types.NewDatum(v)
+
+		b, err := EncodeDecimal([]byte{}, datum.GetMysqlDecimal(), datum.Length(), datum.Frac())
 		c.Assert(err, IsNil)
-		c.Assert(v.Compare(d.GetMysqlDecimal()), Equals, 0)
+		_, d, prec, frac, err := DecodeDecimal(b)
+		if datum.Length() != 0 {
+			c.Assert(prec, Equals, datum.Length())
+			c.Assert(frac, Equals, datum.Frac())
+		} else {
+			prec1, frac1 := datum.GetMysqlDecimal().PrecisionAndFrac()
+			c.Assert(prec, Equals, prec1)
+			c.Assert(frac, Equals, frac1)
+		}
+		c.Assert(err, IsNil)
+		c.Assert(v.Compare(d), Equals, 0)
 	}
 }
 
 func (s *testDecimalSuite) TestFrac(c *C) {
 	defer testleak.AfterTest(c)()
 	inputs := []struct {
-		Input *mysql.MyDecimal
+		Input *types.MyDecimal
 	}{
-		{mysql.NewDecFromInt(3)},
-		{mysql.NewDecFromFloatForTest(0.03)},
+		{types.NewDecFromInt(3)},
+		{types.NewDecFromFloatForTest(0.03)},
 	}
 	for _, v := range inputs {
 		testFrac(c, v.Input)
 	}
 }
 
-func testFrac(c *C, v *mysql.MyDecimal) {
+func testFrac(c *C, v *types.MyDecimal) {
 	var d1 types.Datum
 	d1.SetMysqlDecimal(v)
-	b := EncodeDecimal([]byte{}, d1)
-	_, d2, err := DecodeDecimal(b)
+
+	b, err := EncodeDecimal([]byte{}, d1.GetMysqlDecimal(), d1.Length(), d1.Frac())
 	c.Assert(err, IsNil)
-	cmp, err := d1.CompareDatum(d2)
+	_, dec, _, _, err := DecodeDecimal(b)
 	c.Assert(err, IsNil)
-	c.Assert(cmp, Equals, 0)
-	c.Assert(d1.GetMysqlDecimal().String(), Equals, d2.GetMysqlDecimal().String())
+	c.Assert(dec.String(), Equals, v.String())
 }

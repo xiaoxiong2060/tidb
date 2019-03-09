@@ -14,21 +14,24 @@
 package domain
 
 import (
-	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/ngaut/pools"
 	. "github.com/pingcap/check"
-	"github.com/pingcap/tidb/ast"
-	"github.com/pingcap/tidb/model"
-	"github.com/pingcap/tidb/sessionctx/variable"
-	"github.com/pingcap/tidb/store/localstore"
-	"github.com/pingcap/tidb/store/localstore/goleveldb"
+	"github.com/pingcap/errors"
+	"github.com/pingcap/parser/ast"
+	"github.com/pingcap/parser/model"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/tidb/metrics"
+	"github.com/pingcap/tidb/store/mockstore"
 	"github.com/pingcap/tidb/util/mock"
 	"github.com/pingcap/tidb/util/testleak"
+	dto "github.com/prometheus/client_model/go"
 )
 
 func TestT(t *testing.T) {
+	CustomVerboseFlag = true
 	TestingT(t)
 }
 
@@ -37,19 +40,31 @@ var _ = Suite(&testSuite{})
 type testSuite struct {
 }
 
+func mockFactory() (pools.Resource, error) {
+	return nil, errors.New("mock factory should not be called")
+}
+
+func sysMockFactory(dom *Domain) (pools.Resource, error) {
+	return nil, nil
+}
+
 func (*testSuite) TestT(c *C) {
-	driver := localstore.Driver{Driver: goleveldb.MemoryDriver{}}
-	store, err := driver.Open("memory")
-	c.Assert(err, IsNil)
 	defer testleak.AfterTest(c)()
-
-	ctx := mock.NewContext()
-
-	dom, err := NewDomain(store, 0)
+	store, err := mockstore.NewMockTikvStore()
 	c.Assert(err, IsNil)
+	ddlLease := 80 * time.Millisecond
+	dom := NewDomain(store, ddlLease, 0, mockFactory)
+	err = dom.Init(ddlLease, sysMockFactory)
+	c.Assert(err, IsNil)
+	defer func() {
+		dom.Close()
+	}()
 	store = dom.Store()
+	ctx := mock.NewContext()
+	ctx.Store = store
 	dd := dom.DDL()
 	c.Assert(dd, NotNil)
+	c.Assert(dd.GetLease(), Equals, 80*time.Millisecond)
 	cs := &ast.CharsetOpt{
 		Chs: "utf8",
 		Col: "utf8_bin",
@@ -58,41 +73,78 @@ func (*testSuite) TestT(c *C) {
 	c.Assert(err, IsNil)
 	is := dom.InfoSchema()
 	c.Assert(is, NotNil)
-	dom, err = NewDomain(store, 0)
-	c.Assert(err, IsNil)
 
-	dom.SetLease(10 * time.Second)
+	// for setting lease
+	lease := 100 * time.Millisecond
 
-	m, err := dom.Stats()
+	// for schemaValidator
+	schemaVer := dom.SchemaValidator.(*schemaValidator).latestSchemaVer
+	ver, err := store.CurrentVersion()
 	c.Assert(err, IsNil)
-	c.Assert(m[ddlLastReloadSchemaTS], GreaterEqual, int64(0))
+	ts := ver.Ver
 
-	c.Assert(dom.GetScope("dummy_status"), Equals, variable.DefaultScopeFlag)
-
-	dom.SetLease(10 * time.Millisecond)
-	time.Sleep(20 * time.Millisecond)
-	atomic.StoreInt64(&dom.lastLeaseTS, 0)
-	dom.tryReload()
-	time.Sleep(1 * time.Second)
-
-	// for schemaValidity
-	err = dom.SchemaValidity.Check(0)
-	c.Assert(err, IsNil)
-	dom.SchemaValidity.MockReloadFailed = true
-	err = dom.MustReload()
-	c.Assert(err, NotNil)
-	err = dom.SchemaValidity.Check(0)
-	c.Assert(err, NotNil)
-	dom.SchemaValidity.MockReloadFailed = false
-	err = dom.MustReload()
-	c.Assert(err, IsNil)
-	err = dom.SchemaValidity.Check(0)
-	c.Assert(err, IsNil)
-
-	// for goroutine exit in Reload
-	defaultMinReloadTimeout = 1 * time.Second
-	err = store.Close()
-	c.Assert(err, IsNil)
+	succ := dom.SchemaValidator.Check(ts, schemaVer, nil)
+	c.Assert(succ, Equals, ResultSucc)
+	dom.MockReloadFailed.SetValue(true)
 	err = dom.Reload()
 	c.Assert(err, NotNil)
+	succ = dom.SchemaValidator.Check(ts, schemaVer, nil)
+	c.Assert(succ, Equals, ResultSucc)
+	time.Sleep(lease)
+
+	ver, err = store.CurrentVersion()
+	c.Assert(err, IsNil)
+	ts = ver.Ver
+	succ = dom.SchemaValidator.Check(ts, schemaVer, nil)
+	c.Assert(succ, Equals, ResultUnknown)
+	dom.MockReloadFailed.SetValue(false)
+	err = dom.Reload()
+	c.Assert(err, IsNil)
+	succ = dom.SchemaValidator.Check(ts, schemaVer, nil)
+	c.Assert(succ, Equals, ResultSucc)
+
+	// For slow query.
+	dom.LogSlowQuery(&SlowQueryInfo{SQL: "aaa", Duration: time.Second, Internal: true})
+	dom.LogSlowQuery(&SlowQueryInfo{SQL: "bbb", Duration: 3 * time.Second})
+	dom.LogSlowQuery(&SlowQueryInfo{SQL: "ccc", Duration: 2 * time.Second})
+	// Collecting slow queries is asynchronous, wait a while to ensure it's done.
+	time.Sleep(5 * time.Millisecond)
+
+	res := dom.ShowSlowQuery(&ast.ShowSlow{Tp: ast.ShowSlowTop, Count: 2})
+	c.Assert(res, HasLen, 2)
+	c.Assert(*res[0], Equals, SlowQueryInfo{SQL: "bbb", Duration: 3 * time.Second})
+	c.Assert(*res[1], Equals, SlowQueryInfo{SQL: "ccc", Duration: 2 * time.Second})
+
+	res = dom.ShowSlowQuery(&ast.ShowSlow{Tp: ast.ShowSlowTop, Count: 2, Kind: ast.ShowSlowKindInternal})
+	c.Assert(res, HasLen, 1)
+	c.Assert(*res[0], Equals, SlowQueryInfo{SQL: "aaa", Duration: time.Second, Internal: true})
+
+	res = dom.ShowSlowQuery(&ast.ShowSlow{Tp: ast.ShowSlowTop, Count: 4, Kind: ast.ShowSlowKindAll})
+	c.Assert(res, HasLen, 3)
+	c.Assert(*res[0], Equals, SlowQueryInfo{SQL: "bbb", Duration: 3 * time.Second})
+	c.Assert(*res[1], Equals, SlowQueryInfo{SQL: "ccc", Duration: 2 * time.Second})
+	c.Assert(*res[2], Equals, SlowQueryInfo{SQL: "aaa", Duration: time.Second, Internal: true})
+
+	res = dom.ShowSlowQuery(&ast.ShowSlow{Tp: ast.ShowSlowRecent, Count: 2})
+	c.Assert(res, HasLen, 2)
+	c.Assert(*res[0], Equals, SlowQueryInfo{SQL: "ccc", Duration: 2 * time.Second})
+	c.Assert(*res[1], Equals, SlowQueryInfo{SQL: "bbb", Duration: 3 * time.Second})
+
+	metrics.PanicCounter.Reset()
+	// Since the stats lease is 0 now, so create a new ticker will panic.
+	// Test that they can recover from panic correctly.
+	dom.updateStatsWorker(ctx, nil)
+	dom.autoAnalyzeWorker(nil)
+	counter := metrics.PanicCounter.WithLabelValues(metrics.LabelDomain)
+	pb := &dto.Metric{}
+	counter.Write(pb)
+	c.Assert(pb.GetCounter().GetValue(), Equals, float64(2))
+
+	err = store.Close()
+	c.Assert(err, IsNil)
+}
+
+func (*testSuite) TestErrorCode(c *C) {
+	c.Assert(int(ErrInfoSchemaExpired.ToSQLError().Code), Equals, mysql.ErrUnknown)
+	c.Assert(int(ErrInfoSchemaChanged.ToSQLError().Code), Equals, mysql.ErrUnknown)
 }
